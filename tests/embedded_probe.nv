@@ -1,0 +1,156 @@
+// tests/embedded_probe.nv — the device claim, as firmware that builds
+// for a Cortex-M, boots under QEMU, and checks its answers.
+//
+// `scripts/shard_audit.sh`'s `core-embedded` row copies this file and the
+// modules it names into a package of its own and runs
+//
+//   novo build --target=nrf52-qemu src/probe.nv
+//
+// which produces a Cortex-M4 image or fails.  The same image boots with
+//
+//   qemu-system-arm -machine mps2-an386 -nographic -semihosting -kernel probe.elf
+//
+// and writes `PASS: dhcpv6-embedded` when every check holds.
+//
+// THE CONSUMER IS A DEVICE ON AN IPv6 NETWORK THAT GIVES ADDRESSES AND
+// PREFIXES BY DHCPv6.  It has a network interface that sends and receives
+// UDP datagrams and no heap.  This program is the loop such a device
+// runs, with the network replaced by a server's messages built in the
+// same image: the client solicits, the server advertises, the client
+// requests, the server replies with an address, a delegated prefix and
+// two DNS servers, and the client holds a lease.  Then the clock passes
+// T1 and the client renews, and at the end the client releases.  No
+// datagram is a list or a string; every one is a 1024-byte buffer on the
+// stack, and the build proves it with `@no_alloc`.
+
+use dhcp6msg
+use dhcp6opt
+use dhcp6client
+
+// The client's DUID: DUID-LL, Ethernet, 02:00:00:00:00:01.
+@tier(embedded)
+@no_alloc
+fn device_duid(var d: Vec[u8; 130])
+    var ll: Vec[u8; 128] = Vec.new()
+    let _a = ll.push(0x02 as u8)
+    for _ in 0..4
+        let _b = ll.push(0 as u8)
+    let _c = ll.push(1 as u8)
+    let _ok = dhcp6msg.duid_ll(var d, 1, var ll)
+
+// The server's DUID: DUID-LL, Ethernet, 02:00:00:00:00:99.
+@tier(embedded)
+@no_alloc
+fn server_duid(var d: Vec[u8; 130])
+    var ll: Vec[u8; 128] = Vec.new()
+    let _a = ll.push(0x02 as u8)
+    for _ in 0..4
+        let _b = ll.push(0 as u8)
+    let _c = ll.push(0x99 as u8)
+    let _ok = dhcp6msg.duid_ll(var d, 1, var ll)
+
+// A server's message of `kind` for transaction `txid`: both identifiers,
+// an address 2001:db8::100 with preferred and valid lifetimes of 3600 and
+// 7200 seconds, a prefix 2001:db8:1::/56 with the same lifetimes, and two
+// DNS servers.  The IA options leave T1 and T2 at zero, so the client
+// chooses them.
+@tier(embedded)
+@no_alloc
+fn server_message(kind: Int, txid: Int, var out: Vec[u8; 1024]) -> Bool
+    var cid: Vec[u8; 130] = Vec.new()
+    device_duid(var cid)
+    var sid: Vec[u8; 130] = Vec.new()
+    server_duid(var sid)
+    var ok = dhcp6msg.begin(var out, kind, txid)
+    ok = ok and dhcp6msg.put_client_id(var out, var cid)
+    ok = ok and dhcp6msg.put_server_id(var out, var sid)
+    let na = dhcp6msg.open_ia_na(var out, 1, 0, 0)
+    ok = ok and dhcp6msg.put_ia_addr(var out, dhcp6msg.ip6(0x20010db8, 0, 0, 0x100), 3600, 7200)
+    ok = ok and dhcp6msg.close_option(var out, na)
+    let pd = dhcp6msg.open_ia_pd(var out, 2, 0, 0)
+    ok = ok and dhcp6msg.put_ia_prefix(var out, 3600, 7200, 56, dhcp6msg.ip6(0x20010db8, 0x00010000, 0, 0))
+    ok = ok and dhcp6msg.close_option(var out, pd)
+    var servers: Vec[dhcp6msg.Ip6; 8] = Vec.new()
+    let _s1 = servers.push(dhcp6msg.ip6(0x20010db8, 0, 0, 0x53))
+    let _s2 = servers.push(dhcp6msg.ip6(0x20010db8, 0, 0, 0x54))
+    ok and dhcp6opt.put_dns_servers(var out, var servers)
+
+// The exchange, counted: one point for each thing a device depends on.
+@tier(embedded)
+@no_alloc
+fn score() -> Int
+    var n = 0
+    var duid: Vec[u8; 130] = Vec.new()
+    device_duid(var duid)
+    var dev = dhcp6client.client_new(var duid, dhcp6client.DHCP6_WANT_NA | dhcp6client.DHCP6_WANT_PD, 1, 2)
+
+    var wire: Vec[u8; 1024] = Vec.new()
+    var reply: Vec[u8; 1024] = Vec.new()
+
+    // Time 0: the first tick schedules the Solicit after a random delay;
+    // the second, at that time, builds it for the multicast address.
+    var act = dhcp6client.client_tick(var dev, 0, 0x0001F401, var wire)
+    if act == dhcp6client.DHCP6_ACT_NONE and dhcp6client.client_next_at(var dev) == 500
+        n = n + 1
+    act = dhcp6client.client_tick(var dev, 500, 0x0001F402, var wire)
+    if act == dhcp6client.DHCP6_ACT_SEND and dhcp6msg.msg_type(var wire) == dhcp6msg.DHCP6_SOLICIT
+        n = n + 1
+    if dhcp6msg.validate(var wire) == dhcp6msg.DHCP6_FAULT_NONE and dhcp6msg.xid(var wire) == 0x01F402
+        n = n + 1
+
+    // The server advertises; the client keeps it and waits out the first
+    // timeout, then requests.
+    let _a = server_message(dhcp6msg.DHCP6_ADVERTISE, 0x01F402, var reply)
+    act = dhcp6client.client_receive(var dev, 600, 0, var reply, var wire)
+    if act == dhcp6client.DHCP6_ACT_NONE
+        n = n + 1
+    act = dhcp6client.client_tick(var dev, 1550, 0x0003E803, var wire)
+    if act == dhcp6client.DHCP6_ACT_SEND and dhcp6msg.msg_type(var wire) == dhcp6msg.DHCP6_REQUEST
+        n = n + 1
+
+    // The server replies and the client is bound.
+    let _b = server_message(dhcp6msg.DHCP6_REPLY, 0x03E803, var reply)
+    act = dhcp6client.client_receive(var dev, 1600, 0, var reply, var wire)
+    if act == dhcp6client.DHCP6_ACT_BOUND and dhcp6client.client_state(var dev) == dhcp6client.DHCP6_STATE_BOUND
+        n = n + 1
+
+    // What the lease says.
+    if dhcp6client.client_address(var dev).d == 0x100 and dhcp6client.client_prefix_length(var dev) == 56
+        n = n + 1
+    if dhcp6client.client_dns_count(var dev) == 2 and dhcp6client.client_dns(var dev, 1).d == 0x54
+        n = n + 1
+    if dhcp6client.client_t1_at(var dev) == 1600 + 1800000 and dhcp6client.client_t2_at(var dev) == 1600 + 2880000
+        n = n + 1
+    if dhcp6client.client_remaining(var dev, 1600 + 1000000) == 6200
+        n = n + 1
+
+    // T1 passes: the client renews with a message to the multicast address.
+    act = dhcp6client.client_tick(var dev, 1600 + 1800000, 0x0003E804, var wire)
+    if act == dhcp6client.DHCP6_ACT_SEND and dhcp6client.client_state(var dev) == dhcp6client.DHCP6_STATE_RENEW
+        n = n + 1
+    if dhcp6msg.msg_type(var wire) == dhcp6msg.DHCP6_RENEW and dhcp6msg.find(var wire, dhcp6msg.DHCP6_OPT_SERVERID) >= 0
+        n = n + 1
+    let _c = server_message(dhcp6msg.DHCP6_REPLY, 0x03E804, var reply)
+    act = dhcp6client.client_receive(var dev, 1600 + 1800100, 0, var reply, var wire)
+    if act == dhcp6client.DHCP6_ACT_BOUND and dhcp6client.client_expires_at(var dev) == 1600 + 1800100 + 7200000
+        n = n + 1
+
+    // The client lets the lease go.
+    act = dhcp6client.client_release(var dev, 4000000, 0x00C789B0, var wire)
+    if act == dhcp6client.DHCP6_ACT_SEND and dhcp6msg.msg_type(var wire) == dhcp6msg.DHCP6_RELEASE
+        n = n + 1
+    let _d = server_message(dhcp6msg.DHCP6_REPLY, 0x00C789B0, var reply)
+    act = dhcp6client.client_receive(var dev, 4000100, 0, var reply, var wire)
+    if act == dhcp6client.DHCP6_ACT_RELEASED and dhcp6client.client_has_lease(var dev) == false
+        n = n + 1
+    n
+
+@tier(embedded)
+fn main() [hw, time]
+    bsp.board.init()
+    if score() == 15
+        hal.uart.write("PASS: dhcpv6-embedded\n")
+    else
+        hal.uart.write("FAIL: dhcpv6-embedded\n")
+    loop
+        core.rt.sleep_ms(1000)

@@ -18,6 +18,7 @@ use std.test
 use std.bytes
 use dhcp6msg
 use dhcp6opt
+use dhcp6client
 
 // A message from hexadecimal text.
 fn load(hex: Str) -> Vec[u8; 1024]
@@ -262,3 +263,69 @@ fn test_the_writers_rebuild_the_captured_solicit_and_request_byte_for_byte() [io
     test.assert_eq(build_request(var out2), true)
     var cap2 = load(request_hex())
     test.assert_eq(same(var out2, var cap2), true)
+
+@test
+fn test_the_client_runs_the_captured_exchange_from_solicit_to_release() [io]
+    // The client of the capture: its DUID, an IA_PD with the identifier
+    // 0x27fe8f95 and no IA_NA.  The random words are chosen so that the
+    // transactions are the capture's: 0x100874, 0x49174e and 0xc789b0.
+    var d = client_duid()
+    var c = dhcp6client.client_new(var d, dhcp6client.DHCP6_WANT_PD, 1, 0x27fe8f95)
+    var out: Vec[u8; 1024] = Vec.new()
+    test.assert_eq(dhcp6client.client_tick(var c, 0, 0x100874, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_next_at(var c), 100)
+    test.assert_eq(dhcp6client.client_tick(var c, 100, 0x100874, var out), dhcp6client.DHCP6_ACT_SEND)
+
+    test.case("the Solicit has the capture's transaction and asks for the same association")
+    var cap_solicit = load(solicit_hex())
+    test.assert_eq(dhcp6msg.xid(var out), dhcp6msg.xid(var cap_solicit))
+    test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_SOLICIT)
+    test.assert_eq(dhcp6opt.find_ia(var out, dhcp6msg.DHCP6_OPT_IA_PD, 0x27fe8f95) >= 0, true)
+    test.assert_eq(dhcp6client.client_next_at(var c), 100 + 1010)
+
+    test.case("the captured Advertise is kept, and the Request goes to its server")
+    var adv = load(advertise_hex())
+    test.assert_eq(dhcp6client.client_receive(var c, 200, 0, var adv, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_tick(var c, 1110, 0x49174e, var out), dhcp6client.DHCP6_ACT_SEND)
+    var cap_request = load(request_hex())
+    test.assert_eq(dhcp6msg.xid(var out), 0x49174e)
+    test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_REQUEST)
+    var sd: Vec[u8; 130] = Vec.new()
+    let want = dhcp6msg.find(var cap_request, dhcp6msg.DHCP6_OPT_SERVERID)
+    test.assert_eq(dhcp6msg.read_duid(var cap_request, want, var sd), true)
+    test.assert_eq(dhcp6msg.option_equals_duid(var out, dhcp6msg.find(var out, dhcp6msg.DHCP6_OPT_SERVERID), var sd), true)
+
+    test.case("the captured Reply binds the prefix 2001:0:0:fe00::/64 for 7200 seconds")
+    var rep = load(reply_hex())
+    test.assert_eq(dhcp6client.client_receive(var c, 1200, 0, var rep, var out), dhcp6client.DHCP6_ACT_BOUND)
+    test.assert_eq(dhcp6client.client_has_prefix(var c), true)
+    test.assert_eq(dhcp6client.client_has_address(var c), false)
+    test.assert_eq(dhcp6client.client_prefix_length(var c), 64)
+    let p = dhcp6client.client_prefix(var c)
+    test.assert_eq(p.a, 0x20010000)
+    test.assert_eq(p.b, 0x0000fe00)
+    test.assert_eq(dhcp6client.client_t1_at(var c), 1200 + 2250000)
+    test.assert_eq(dhcp6client.client_t2_at(var c), 1200 + 3600000)
+    test.assert_eq(dhcp6client.client_expires_at(var c), 1200 + 7200000)
+
+    test.case("the Release carries the capture's transaction, identifiers and prefix with lifetimes of zero")
+    test.assert_eq(dhcp6client.client_release(var c, 2000, 0xc789b0, var out), dhcp6client.DHCP6_ACT_SEND)
+    var cap_release = load(release_hex())
+    test.assert_eq(dhcp6msg.xid(var out), dhcp6msg.xid(var cap_release))
+    test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_RELEASE)
+    var mine = client_duid()
+    test.assert_eq(dhcp6msg.option_equals_duid(var out, dhcp6msg.find(var out, dhcp6msg.DHCP6_OPT_CLIENTID), var mine), true)
+    test.assert_eq(dhcp6msg.option_equals_duid(var out, dhcp6msg.find(var out, dhcp6msg.DHCP6_OPT_SERVERID), var sd), true)
+    let ia = dhcp6opt.find_ia(var out, dhcp6msg.DHCP6_OPT_IA_PD, 0x27fe8f95)
+    let rp = dhcp6msg.find_option(var out, dhcp6opt.ia_options_start(ia), dhcp6msg.opt_end(var out, ia), dhcp6msg.DHCP6_OPT_IAPREFIX, 0)
+    let cia = dhcp6opt.find_ia(var cap_release, dhcp6msg.DHCP6_OPT_IA_PD, 0x27fe8f95)
+    let cp = dhcp6msg.find_option(var cap_release, dhcp6opt.ia_options_start(cia), dhcp6msg.opt_end(var cap_release, cia), dhcp6msg.DHCP6_OPT_IAPREFIX, 0)
+    test.assert_eq(dhcp6opt.iaprefix_length(var out, rp), dhcp6opt.iaprefix_length(var cap_release, cp))
+    test.assert_eq(dhcp6opt.iaprefix_valid(var out, rp), dhcp6opt.iaprefix_valid(var cap_release, cp))
+    test.assert_eq(dhcp6opt.iaprefix_preferred(var out, rp), dhcp6opt.iaprefix_preferred(var cap_release, cp))
+    test.assert_eq(dhcp6msg.ip6_eq(dhcp6opt.iaprefix_prefix(var out, rp), dhcp6opt.iaprefix_prefix(var cap_release, cp)), true)
+
+    test.case("the captured Reply to the Release ends the exchange")
+    var done = load(release_reply_hex())
+    test.assert_eq(dhcp6client.client_receive(var c, 2100, 0, var done, var out), dhcp6client.DHCP6_ACT_RELEASED)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_IDLE)

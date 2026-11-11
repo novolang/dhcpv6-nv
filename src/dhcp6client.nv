@@ -305,9 +305,10 @@ pub @tier(embedded)
 fn client_dns_count(var c: Dhcp6Client) -> Int
     c.ndns
 
-// The offset after the name that starts at `at` in the domain search
-// list the lease gave, or -1 when the list does not hold a well-formed
-// name there.
+// The offset after the name that starts at `at`, a position inside the
+// domain search list the lease gave, or -1 when the list does not hold a
+// well-formed name there.  Every position it moves to is inside the list,
+// because a label that would end at or past the list's end answers -1.
 @tier(embedded)
 @no_alloc
 fn domain_end(var raw: Vec[u8; 128], at: Int) -> Int
@@ -316,17 +317,14 @@ fn domain_end(var raw: Vec[u8; 128], at: Int) -> Int
     var live = at >= 0
     for _ in 0..130
         if live
-            if pos >= raw.len()
+            let len = raw[pos] as Int
+            if len == 0
+                result = pos + 1
+                live = false
+            elif len > 63 or pos + 1 + len >= raw.len()
                 live = false
             else
-                let len = raw[pos] as Int
-                if len == 0
-                    result = pos + 1
-                    live = false
-                elif len > 63 or pos + 1 + len >= raw.len()
-                    live = false
-                else
-                    pos = pos + 1 + len
+                pos = pos + 1 + len
     result
 
 // The offset in the search list of the `n`-th name, or -1.
@@ -352,14 +350,6 @@ fn domain_start(var raw: Vec[u8; 128], n: Int) -> Int
             live = false
     result
 
-// Append one byte to a text buffer.
-@tier(embedded)
-@no_alloc
-fn push_text(var out: Vec[u8; 256], v: Int) -> Bool
-    match out.push((v & 255) as u8)
-        Ok(_)  => true
-        Err(_) => false
-
 // How many names the domain search list of the lease holds.
 pub @tier(embedded)
 @no_alloc
@@ -372,7 +362,9 @@ fn client_domain_count(var c: Dhcp6Client) -> Int
 
 // The `n`-th name of the domain search list as text with the labels
 // joined by dots and no trailing dot, written into `out` (replacing its
-// content).  Answers false when there is no such name.
+// content); the root is one dot.  A name is at most 128 bytes in label
+// form, so its text always fits.  Answers false when there is no such
+// name.
 pub @tier(embedded)
 @no_alloc
 fn client_domain_text(var c: Dhcp6Client, n: Int, var out: Vec[u8; 256]) -> Bool
@@ -384,19 +376,18 @@ fn client_domain_text(var c: Dhcp6Client, n: Int, var out: Vec[u8; 256]) -> Bool
         let end = domain_end(var c.domains, at)
         var pos = at
         var first = true
-        var ok = true
         for _ in 0..130
             if pos < end - 1
                 let len = c.domains[pos] as Int
                 if not first
-                    ok = ok and push_text(var out, 46)
+                    let _d = out.push(46 as u8)
                 first = false
                 for j in 0..len
-                    ok = ok and push_text(var out, c.domains[pos + 1 + j] as Int)
+                    let _p = out.push(c.domains[pos + 1 + j])
                 pos = pos + 1 + len
         if first
-            ok = push_text(var out, 46)
-        ok
+            let _r = out.push(46 as u8)
+        true
 
 // The address of the first NTP server the lease gave, or ::.
 pub @tier(embedded)
@@ -416,8 +407,9 @@ pub @tier(embedded)
 @no_alloc
 fn client_server_id(var c: Dhcp6Client, var d: Vec[u8; 130]) -> Bool
     d.clear()
-    for i in 0..c.server.len()
-        let _p = d.push(c.server[i])
+    if c.has_server
+        for i in 0..c.server.len()
+            let _p = d.push(c.server[i])
     c.has_server
 
 // The transaction identifier of the exchange in progress.
@@ -695,10 +687,9 @@ fn begin_exchange(var c: Dhcp6Client, now: Int, random: Int, kind: Int, var out:
         c.rt = irt + rand_part(irt, random)
     c.rt = cap_rt(c.rt, c.mrt, random)
     c.next_at = now + c.rt
-    if build(var c, now, kind, var out)
-        send_action(var c)
-    else
-        DHCP6_ACT_NONE
+    // A message this client builds is under 500 bytes, so it always fits.
+    let _built = build(var c, now, kind, var out)
+    send_action(var c)
 
 // Send the message of the exchange in progress again, with the next
 // timeout of section 15.
@@ -708,10 +699,8 @@ fn retransmit(var c: Dhcp6Client, now: Int, random: Int, var out: Vec[u8; 1024])
     c.count = c.count + 1
     c.rt = cap_rt(2 * c.rt + rand_part(c.rt, random), c.mrt, random)
     c.next_at = now + c.rt
-    if build(var c, now, kind_of_state(c.state), var out)
-        send_action(var c)
-    else
-        DHCP6_ACT_NONE
+    let _built = build(var c, now, kind_of_state(c.state), var out)
+    send_action(var c)
 
 // Choose the best Advertise held and send the Request for it.
 @tier(embedded)
@@ -860,9 +849,13 @@ fn take_max_rt(var c: Dhcp6Client, var msg: Vec[u8; 1024])
     let s = dhcp6opt.sol_max_rt(var msg)
     if s > 0
         c.sol_max_rt = s * 1000
+        if c.state == DHCP6_STATE_SOLICIT
+            c.mrt = c.sol_max_rt
     let i = dhcp6opt.inf_max_rt(var msg)
     if i > 0
         c.inf_max_rt = i * 1000
+        if c.state == DHCP6_STATE_INFORM
+            c.mrt = c.inf_max_rt
 
 // Take the configuration options of a Reply.  An option the Reply does
 // not carry is forgotten, as section 18.2.10 says.

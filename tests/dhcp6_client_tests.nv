@@ -1,0 +1,1330 @@
+// dhcp6_client_tests.nv — the client of RFC 8415 section 18.2, one
+// exchange at a time.
+//
+// Every test sets the clock and the random word itself and writes the
+// server's messages itself, so each says what the client was told.  The
+// random word is built by `rnd(r, low)`: bits 8 to 23 are `r`, which
+// section 15's randomisation factor reads, and the low 24 bits are the
+// transaction identifier.  The factor is `r % 2001 - 1000` ten
+// thousandths of the timeout, so `r = 1000` is a factor of zero and
+// `r = 0` is -10 %.  The first Solicit uses `r % 1000 + 1`, which is
+// above zero, so `r = 500` is +501 ten thousandths: 1000 ms become 1050.
+
+use std.test
+use dhcp6msg
+use dhcp6opt
+use dhcp6client
+
+// A random word whose bits 8 to 23 are `r` and whose low byte is `low`.
+fn rnd(r: Int, low: Int) -> Int
+    (r << 8) | (low & 255)
+
+// The client's DUID: DUID-LL, Ethernet, 00:11:22:33:44:55.
+fn client_duid() -> Vec[u8; 130]
+    var d: Vec[u8; 130] = Vec.new()
+    var ll: Vec[u8; 128] = Vec.new()
+    for b in [0x00, 0x11, 0x22, 0x33, 0x44, 0x55]
+        let _p = ll.push(b as u8)
+    let _ok = dhcp6msg.duid_ll(var d, 1, var ll)
+    d
+
+// A server's DUID: DUID-LL, Ethernet, aa:bb:cc:dd:ee:0<who>.
+fn server_duid(who: Int) -> Vec[u8; 130]
+    var d: Vec[u8; 130] = Vec.new()
+    var ll: Vec[u8; 128] = Vec.new()
+    for b in [0xaa, 0xbb, 0xcc, 0xdd, 0xee, who]
+        let _p = ll.push(b as u8)
+    let _ok = dhcp6msg.duid_ll(var d, 1, var ll)
+    d
+
+// What a message from a test server holds.
+const S_NA = 1
+const S_PD = 2
+const S_RAPID = 4
+const S_DNS = 8
+const S_UNICAST = 16
+const S_PREF = 32
+const S_DOMAIN = 64
+const S_NTP = 128
+const S_NO_CLIENT_ID = 256
+const S_NO_SERVER_ID = 512
+const S_OTHER_CLIENT = 1024
+const S_REFRESH = 2048
+const S_MAX_RT = 4096
+
+struct Spec
+    var kind: Int
+    var xid: Int
+    var who: Int
+    var parts: Int
+    var pref: Int
+    var t1: Int
+    var t2: Int
+    var pl: Int
+    var vl: Int
+    var status: Int
+    var ia_status: Int
+    // The IA_PD's own times and lifetimes.
+    var pt1: Int
+    var pt2: Int
+    var ppl: Int
+    var pvl: Int
+
+// A message of `kind` for transaction `xid` from server 1 with nothing
+// in it but the two identifiers.
+fn spec(kind: Int, xid: Int) -> Spec
+    Spec { kind: kind, xid: xid, who: 1, parts: 0, pref: 0, t1: 0, t2: 0, pl: 7200, vl: 10800, status: 0, ia_status: 0, pt1: 0, pt2: 0, ppl: 7200, pvl: 10800 }
+
+// The address every test server hands out: 2001:db8::100.
+fn leased() -> dhcp6msg.Ip6
+    dhcp6msg.ip6(0x20010db8, 0, 0, 0x100)
+
+// The prefix every test server delegates: 2001:db8:1::/56.
+fn delegated() -> dhcp6msg.Ip6
+    dhcp6msg.ip6(0x20010db8, 0x00010000, 0, 0)
+
+// Build the message a Spec describes.
+fn srv(s: Spec, var out: Vec[u8; 1024]) -> Bool
+    var cid = client_duid()
+    if (s.parts & S_OTHER_CLIENT) != 0
+        cid[9] = 0x56 as u8
+    var sid = server_duid(s.who)
+    var ok = dhcp6msg.begin(var out, s.kind, s.xid)
+    if (s.parts & S_NO_CLIENT_ID) == 0
+        ok = ok and dhcp6msg.put_client_id(var out, var cid)
+    if (s.parts & S_NO_SERVER_ID) == 0
+        ok = ok and dhcp6msg.put_server_id(var out, var sid)
+    if s.status != 0
+        ok = ok and dhcp6msg.put_status_code(var out, s.status)
+    if (s.parts & S_PREF) != 0
+        ok = ok and dhcp6msg.put_preference(var out, s.pref)
+    if (s.parts & S_NA) != 0
+        let ia = dhcp6msg.open_ia_na(var out, 1, s.t1, s.t2)
+        if s.ia_status != 0
+            ok = ok and dhcp6msg.put_status_code(var out, s.ia_status)
+        else
+            ok = ok and dhcp6msg.put_ia_addr(var out, leased(), s.pl, s.vl)
+        ok = ok and dhcp6msg.close_option(var out, ia)
+    if (s.parts & S_PD) != 0
+        let ia = dhcp6msg.open_ia_pd(var out, 2, s.pt1, s.pt2)
+        if s.ia_status != 0
+            ok = ok and dhcp6msg.put_status_code(var out, s.ia_status)
+        else
+            ok = ok and dhcp6msg.put_ia_prefix(var out, s.ppl, s.pvl, 56, delegated())
+        ok = ok and dhcp6msg.close_option(var out, ia)
+    if (s.parts & S_RAPID) != 0
+        ok = ok and dhcp6msg.put_rapid_commit(var out)
+    if (s.parts & S_UNICAST) != 0
+        ok = ok and dhcp6msg.put_server_unicast(var out, dhcp6msg.ip6(0x20010db8, 0, 0, 0x99))
+    if (s.parts & S_DNS) != 0
+        var servers: Vec[dhcp6msg.Ip6; 8] = Vec.new()
+        let _a = servers.push(dhcp6msg.ip6(0x20010db8, 0, 0, 0x53))
+        let _b = servers.push(dhcp6msg.ip6(0x20010db8, 0, 0, 0x54))
+        ok = ok and dhcp6opt.put_dns_servers(var out, var servers)
+    if (s.parts & S_DOMAIN) != 0
+        let dl = dhcp6msg.open_option(var out, dhcp6msg.DHCP6_OPT_DOMAIN_LIST)
+        var n1: Vec[u8; 128] = Vec.new()
+        for c in [0x65, 0x78, 0x2e, 0x6e, 0x65, 0x74]
+            let _p = n1.push(c as u8)
+        ok = ok and dhcp6opt.put_domain_name(var out, var n1)
+        var n2: Vec[u8; 128] = Vec.new()
+        for c in [0x61, 0x2e, 0x62, 0x2e, 0x6f, 0x72, 0x67]
+            let _p = n2.push(c as u8)
+        ok = ok and dhcp6opt.put_domain_name(var out, var n2)
+        ok = ok and dhcp6msg.close_option(var out, dl)
+    if (s.parts & S_NTP) != 0
+        let o = dhcp6opt.open_ntp_server(var out)
+        ok = ok and dhcp6opt.put_ntp_server_address(var out, dhcp6msg.ip6(0x20010db8, 0, 0, 0x123))
+        ok = ok and dhcp6msg.close_option(var out, o)
+    if (s.parts & S_REFRESH) != 0
+        ok = ok and dhcp6msg.put_info_refresh_time(var out, 3600)
+    if (s.parts & S_MAX_RT) != 0
+        ok = ok and dhcp6msg.put_sol_max_rt(var out, 60)
+        ok = ok and dhcp6msg.put_inf_max_rt(var out, 90)
+    ok
+
+// Hand a client the message a Spec describes and answer its action.
+fn feed(var c: dhcp6client.Dhcp6Client, now: Int, random: Int, s: Spec, var out: Vec[u8; 1024]) -> Int
+    var m: Vec[u8; 1024] = Vec.new()
+    let _ok = srv(s, var m)
+    dhcp6client.client_receive(var c, now, random, var m, var out)
+
+// A client with an address association 1 and a prefix association 2.
+fn new_client(flags: Int) -> dhcp6client.Dhcp6Client
+    var d = client_duid()
+    dhcp6client.client_new(var d, flags, 1, 2)
+
+// Take a client to SOLICIT: a tick that schedules at time 0 and a tick
+// at 500 that sends.  The transaction is 0x01F402, the first timeout
+// 1050 ms, so the next transmission is due at 1550.
+fn start(var c: dhcp6client.Dhcp6Client, var out: Vec[u8; 1024]) -> Int
+    let _a = dhcp6client.client_tick(var c, 0, rnd(500, 1), var out)
+    dhcp6client.client_tick(var c, 500, rnd(500, 2), var out)
+
+// Take a client with `flags` to BOUND at time 1600, through a Solicit,
+// an Advertise from server 1 and a Reply.  `parts` says what the Reply
+// holds.  The Request goes at 1550 with transaction 0x03E803.
+fn bind(var c: dhcp6client.Dhcp6Client, parts: Int, t1: Int, t2: Int, pl: Int, vl: Int) -> Int
+    var out: Vec[u8; 1024] = Vec.new()
+    let _s = start(var c, var out)
+    var adv = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    adv.parts = parts
+    adv.t1 = t1
+    adv.t2 = t2
+    adv.pl = pl
+    adv.vl = vl
+    let _f = feed(var c, 600, rnd(1000, 9), adv, var out)
+    let _t = dhcp6client.client_tick(var c, 1550, rnd(1000, 3), var out)
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x03E803)
+    rep.parts = parts
+    rep.t1 = t1
+    rep.t2 = t2
+    rep.pl = pl
+    rep.vl = vl
+    feed(var c, 1600, rnd(1000, 9), rep, var out)
+
+// The offset of the first IA Address in an IA_NA of `m`, or -1.
+fn addr_in(var m: Vec[u8; 1024]) -> Int
+    let ia = dhcp6opt.find_ia(var m, dhcp6msg.DHCP6_OPT_IA_NA, 1)
+    if ia < 0
+        -1
+    else
+        dhcp6msg.find_option(var m, dhcp6opt.ia_options_start(ia), dhcp6msg.opt_end(var m, ia), dhcp6msg.DHCP6_OPT_IAADDR, 0)
+
+// ── The first exchange ──────────────────────────────────────────────
+
+@test
+fn test_a_new_client_waits_a_random_delay_and_then_sends_a_solicit() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    var out: Vec[u8; 1024] = Vec.new()
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_INIT)
+    test.assert_eq(dhcp6client.client_next_at(var c), 0)
+    test.assert_eq(dhcp6client.client_has_lease(var c), false)
+
+    test.case("the first tick only schedules: a delay of up to a second")
+    test.assert_eq(dhcp6client.client_tick(var c, 0, rnd(500, 1), var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_STARTING)
+    test.assert_eq(dhcp6client.client_next_at(var c), 500)
+    test.assert_eq(dhcp6client.client_tick(var c, 499, rnd(500, 2), var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(out.len(), 0)
+
+    test.case("the second sends the Solicit to the multicast address")
+    test.assert_eq(dhcp6client.client_tick(var c, 500, rnd(500, 2), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_SOLICIT)
+    test.assert_eq(dhcp6msg.validate(var out), dhcp6msg.DHCP6_FAULT_NONE)
+    test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_SOLICIT)
+    test.assert_eq(dhcp6msg.xid(var out), 0x01F402)
+    test.assert_eq(dhcp6client.client_xid(var c), 0x01F402)
+
+    test.case("it names the client, asks for an address and for four options, and has no server")
+    var mine = client_duid()
+    let cid = dhcp6msg.find(var out, dhcp6msg.DHCP6_OPT_CLIENTID)
+    test.assert_eq(dhcp6msg.option_equals_duid(var out, cid, var mine), true)
+    test.assert_eq(dhcp6msg.find(var out, dhcp6msg.DHCP6_OPT_SERVERID), -1)
+    test.assert_eq(dhcp6opt.elapsed_time(var out), 0)
+    test.assert_eq(dhcp6opt.find_ia(var out, dhcp6msg.DHCP6_OPT_IA_NA, 1) >= 0, true)
+    test.assert_eq(dhcp6opt.find_ia(var out, dhcp6msg.DHCP6_OPT_IA_PD, 2), -1)
+    test.assert_eq(dhcp6opt.oro_contains(var out, 23), true)
+    test.assert_eq(dhcp6opt.oro_contains(var out, 24), true)
+    test.assert_eq(dhcp6opt.oro_contains(var out, 56), true)
+    test.assert_eq(dhcp6opt.oro_contains(var out, 82), true)
+    test.assert_eq(dhcp6opt.oro_contains(var out, 83), false)
+    test.assert_eq(dhcp6opt.has_rapid_commit(var out), false)
+    test.assert_eq(addr_in(var out), -1)
+
+    test.case("the next transmission is due after the first timeout: 1000 plus 0.501 percent tenths")
+    test.assert_eq(dhcp6client.client_next_at(var c), 1550)
+
+@test
+fn test_a_solicit_is_repeated_with_a_doubling_timeout() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _a = start(var c, var out)
+    test.assert_eq(dhcp6client.client_tick(var c, 1549, rnd(1000, 3), var out), dhcp6client.DHCP6_ACT_NONE)
+
+    test.case("second transmission at 1550: 2 x 1050 + 0")
+    test.assert_eq(dhcp6client.client_tick(var c, 1550, rnd(1000, 3), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_SOLICIT)
+    test.assert_eq(dhcp6msg.xid(var out), 0x01F402)
+    test.assert_eq(dhcp6client.client_next_at(var c), 1550 + 2100)
+
+    test.case("the Elapsed Time counts hundredths of a second since the first Solicit at 500")
+    test.assert_eq(dhcp6opt.elapsed_time(var out), (1550 - 500) / 10)
+
+    test.case("third at 3650: 2 x 2100, fourth 2 x 4200 more")
+    test.assert_eq(dhcp6client.client_tick(var c, 3650, rnd(1000, 3), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_next_at(var c), 3650 + 4200)
+    test.assert_eq(dhcp6client.client_tick(var c, 7850, rnd(1000, 3), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_next_at(var c), 7850 + 8400)
+
+    test.case("the randomisation moves each timeout by up to 10 percent: r = 0 is -10 percent, r = 2000 is +10 percent")
+    var d = new_client(dhcp6client.DHCP6_WANT_NA)
+    let _b = start(var d, var out)
+    test.assert_eq(dhcp6client.client_tick(var d, 1550, rnd(0, 3), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_next_at(var d), 1550 + 2100 - 105)
+    var e = new_client(dhcp6client.DHCP6_WANT_NA)
+    let _c = start(var e, var out)
+    test.assert_eq(dhcp6client.client_tick(var e, 1550, rnd(2000, 3), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_next_at(var e), 1550 + 2100 + 105)
+
+@test
+fn test_the_first_solicit_timeout_is_strictly_above_the_initial_one() [io]
+    test.case("the smallest positive factor still adds a millisecond")
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _a = dhcp6client.client_tick(var c, 0, rnd(0, 1), var out)
+    test.assert_eq(dhcp6client.client_next_at(var c), 0)
+    test.assert_eq(dhcp6client.client_tick(var c, 0, rnd(1000, 2), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_next_at(var c), 0 + 1001)
+    test.case("the largest factor adds 10 percent")
+    var d = new_client(dhcp6client.DHCP6_WANT_NA)
+    let _b = dhcp6client.client_tick(var d, 0, rnd(0, 1), var out)
+    test.assert_eq(dhcp6client.client_tick(var d, 0, rnd(999, 2), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_next_at(var d), 1100)
+
+@test
+fn test_the_best_advertise_by_preference_is_requested_at_the_end_of_the_first_timeout() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _a = start(var c, var out)
+
+    test.case("two Advertise messages: preference 10 from server 1, then 50 from server 2")
+    var a1 = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    a1.parts = S_NA | S_PREF
+    a1.pref = 10
+    test.assert_eq(feed(var c, 600, rnd(1000, 9), a1, var out), dhcp6client.DHCP6_ACT_NONE)
+    var a2 = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    a2.parts = S_NA | S_PREF
+    a2.pref = 50
+    a2.who = 2
+    test.assert_eq(feed(var c, 700, rnd(1000, 9), a2, var out), dhcp6client.DHCP6_ACT_NONE)
+
+    test.case("a third with a lower preference does not replace it")
+    var a3 = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    a3.parts = S_NA | S_PREF
+    a3.pref = 20
+    a3.who = 3
+    test.assert_eq(feed(var c, 800, rnd(1000, 9), a3, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_SOLICIT)
+
+    test.case("the Request goes when the first timeout ends, to server 2")
+    test.assert_eq(dhcp6client.client_tick(var c, 1549, rnd(1000, 3), var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_tick(var c, 1550, rnd(1000, 3), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_REQUEST)
+    test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_REQUEST)
+    test.assert_eq(dhcp6msg.xid(var out), 0x03E803)
+    var want = server_duid(2)
+    let sid = dhcp6msg.find(var out, dhcp6msg.DHCP6_OPT_SERVERID)
+    test.assert_eq(dhcp6msg.option_equals_duid(var out, sid, var want), true)
+    test.assert_eq(dhcp6opt.elapsed_time(var out), 0)
+    test.assert_eq(dhcp6client.client_next_at(var c), 1550 + 1000)
+
+    test.case("the Request asks for the address and carries no lifetimes")
+    test.assert_eq(addr_in(var out), -1)
+    test.assert_eq(dhcp6opt.find_ia(var out, dhcp6msg.DHCP6_OPT_IA_NA, 1) >= 0, true)
+
+@test
+fn test_a_preference_of_255_is_requested_at_once() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _a = start(var c, var out)
+    var adv = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    adv.parts = S_NA | S_PREF
+    adv.pref = 255
+    test.assert_eq(feed(var c, 600, rnd(1000, 7), adv, var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_REQUEST)
+    test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_REQUEST)
+    test.assert_eq(dhcp6msg.xid(var out), 0x03E807)
+
+@test
+fn test_an_advertise_after_the_first_timeout_is_requested_at_once() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _a = start(var c, var out)
+    test.assert_eq(dhcp6client.client_tick(var c, 1550, rnd(1000, 3), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_SOLICIT)
+    var adv = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    adv.parts = S_NA
+    test.assert_eq(feed(var c, 2000, rnd(1000, 8), adv, var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_REQUEST)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_REQUEST)
+
+@test
+fn test_advertise_messages_the_client_must_ignore() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _a = start(var c, var out)
+    test.assert_eq(dhcp6client.client_next_at(var c), 1550)
+
+    test.case("NoAddrsAvail at the top (section 18.2.9)")
+    var a = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    a.parts = S_NA
+    a.status = dhcp6msg.DHCP6_STATUS_NO_ADDRS_AVAIL
+    test.assert_eq(feed(var c, 600, rnd(1000, 9), a, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.case("NoPrefixAvail at the top")
+    a.status = dhcp6msg.DHCP6_STATUS_NO_PREFIX_AVAIL
+    test.assert_eq(feed(var c, 600, rnd(1000, 9), a, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.case("another failure status at the top")
+    a.status = dhcp6msg.DHCP6_STATUS_UNSPEC_FAIL
+    test.assert_eq(feed(var c, 600, rnd(1000, 9), a, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.case("no address and no prefix in it")
+    var b = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    test.assert_eq(feed(var c, 600, rnd(1000, 9), b, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.case("an IA_NA that carries a status instead of an address")
+    var d = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    d.parts = S_NA
+    d.ia_status = dhcp6msg.DHCP6_STATUS_NO_ADDRS_AVAIL
+    test.assert_eq(feed(var c, 600, rnd(1000, 9), d, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.case("a transaction that is not this one")
+    var e = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F403)
+    e.parts = S_NA
+    test.assert_eq(feed(var c, 600, rnd(1000, 9), e, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.case("another client's identifier")
+    var f = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    f.parts = S_NA | S_OTHER_CLIENT
+    test.assert_eq(feed(var c, 600, rnd(1000, 9), f, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.case("no Client Identifier")
+    var g = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    g.parts = S_NA | S_NO_CLIENT_ID
+    test.assert_eq(feed(var c, 600, rnd(1000, 9), g, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.case("no Server Identifier")
+    var h = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    h.parts = S_NA | S_NO_SERVER_ID
+    test.assert_eq(feed(var c, 600, rnd(1000, 9), h, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.case("a message that is neither Advertise nor Reply")
+    var i = spec(dhcp6msg.DHCP6_RENEW, 0x01F402)
+    i.parts = S_NA
+    test.assert_eq(feed(var c, 600, rnd(1000, 9), i, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.case("a Reply, with no Rapid Commit, to a Solicit")
+    var j = spec(dhcp6msg.DHCP6_REPLY, 0x01F402)
+    j.parts = S_NA
+    test.assert_eq(feed(var c, 600, rnd(1000, 9), j, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.case("a Reconfigure message, which needs authentication this package does not verify")
+    var k = spec(dhcp6msg.DHCP6_RECONFIGURE, 0x01F402)
+    k.parts = S_NA
+    test.assert_eq(feed(var c, 600, rnd(1000, 9), k, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.case("a damaged message")
+    var junk = bad_message()
+    test.assert_eq(dhcp6client.client_receive(var c, 600, 0, var junk, var out), dhcp6client.DHCP6_ACT_NONE)
+
+    test.case("none of them was kept: at the end of the first timeout the client sends a Solicit again")
+    test.assert_eq(dhcp6client.client_tick(var c, 1550, rnd(1000, 3), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_SOLICIT)
+
+// A message that is a Reply with a transaction of 0x01F402 and an option
+// that runs past the end.
+fn bad_message() -> Vec[u8; 1024]
+    var m: Vec[u8; 1024] = Vec.new()
+    for b in [0x07, 0x01, 0xF4, 0x02, 0x00, 0x01, 0x00, 0x20, 0x00]
+        let _p = m.push(b as u8)
+    m
+
+// ── Request and Reply ───────────────────────────────────────────────
+
+@test
+fn test_a_reply_binds_an_address_with_t1_and_t2_chosen_by_the_client() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    test.assert_eq(bind(var c, S_NA | S_DNS | S_DOMAIN | S_NTP, 0, 0, 7200, 10800), dhcp6client.DHCP6_ACT_BOUND)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_BOUND)
+    test.assert_eq(dhcp6client.client_has_lease(var c), true)
+    test.assert_eq(dhcp6client.client_has_address(var c), true)
+    test.assert_eq(dhcp6client.client_has_prefix(var c), false)
+    test.assert_eq(dhcp6msg.ip6_eq(dhcp6client.client_address(var c), leased()), true)
+
+    test.case("T1 is half and T2 0.8 of the preferred lifetime, both counted from the Reply at 1600")
+    test.assert_eq(dhcp6client.client_t1_at(var c), 1600 + 3600000)
+    test.assert_eq(dhcp6client.client_t2_at(var c), 1600 + 5760000)
+    test.assert_eq(dhcp6client.client_expires_at(var c), 1600 + 10800000)
+    test.assert_eq(dhcp6client.client_next_at(var c), 1600 + 3600000)
+    test.assert_eq(dhcp6client.client_remaining(var c, 1600), 10800)
+    test.assert_eq(dhcp6client.client_remaining(var c, 1600 + 10800000), 0)
+    test.assert_eq(dhcp6client.client_remaining(var c, 99999999999), 0)
+
+    test.case("the configuration the Reply carried")
+    test.assert_eq(dhcp6client.client_dns_count(var c), 2)
+    test.assert_eq(dhcp6client.client_dns(var c, 0).d, 0x53)
+    test.assert_eq(dhcp6client.client_dns(var c, 1).d, 0x54)
+    test.assert_eq(dhcp6msg.ip6_is_zero(dhcp6client.client_dns(var c, 2)), true)
+    test.assert_eq(dhcp6client.client_ntp(var c).d, 0x123)
+    test.assert_eq(dhcp6client.client_domain_count(var c), 2)
+    var text: Vec[u8; 256] = Vec.new()
+    test.assert_eq(dhcp6client.client_domain_text(var c, 1, var text), true)
+    test.assert_eq(text.len(), 7)
+    test.assert_eq(text[0] as Int, 0x61)
+    test.assert_eq(dhcp6client.client_domain_text(var c, 2, var text), false)
+    test.assert_eq(text.len(), 0)
+
+    test.case("the server is the one that was requested")
+    var sd: Vec[u8; 130] = Vec.new()
+    test.assert_eq(dhcp6client.client_server_id(var c, var sd), true)
+    var want = server_duid(1)
+    test.assert_eq(sd.len(), want.len())
+    test.assert_eq(sd[9] as Int, 1)
+
+@test
+fn test_the_servers_t1_and_t2_are_used_when_they_are_given() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    test.assert_eq(bind(var c, S_NA, 1000, 2000, 7200, 10800), dhcp6client.DHCP6_ACT_BOUND)
+    test.assert_eq(dhcp6client.client_t1_at(var c), 1600 + 1000000)
+    test.assert_eq(dhcp6client.client_t2_at(var c), 1600 + 2000000)
+
+@test
+fn test_an_infinite_lease_is_never_renewed() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    var inf = dhcp6msg.DHCP6_INFINITY
+    test.assert_eq(bind(var c, S_NA, 0, 0, inf, inf), dhcp6client.DHCP6_ACT_BOUND)
+    test.assert_eq(dhcp6client.client_t1_at(var c), dhcp6client.DHCP6_NEVER)
+    test.assert_eq(dhcp6client.client_next_at(var c), -1)
+    test.assert_eq(dhcp6client.client_remaining(var c, 5000), dhcp6msg.DHCP6_INFINITY)
+    var out: Vec[u8; 1024] = Vec.new()
+    test.assert_eq(dhcp6client.client_tick(var c, 999999999999, rnd(1000, 1), var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_BOUND)
+
+@test
+fn test_a_reply_with_t1_above_t2_is_discarded() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _s = start(var c, var out)
+    var adv = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    adv.parts = S_NA
+    let _f = feed(var c, 600, rnd(1000, 9), adv, var out)
+    let _t = dhcp6client.client_tick(var c, 1550, rnd(1000, 3), var out)
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x03E803)
+    rep.parts = S_NA
+    rep.t1 = 200
+    rep.t2 = 100
+    test.assert_eq(feed(var c, 1600, rnd(1000, 9), rep, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_REQUEST)
+    test.assert_eq(dhcp6client.client_has_lease(var c), false)
+
+@test
+fn test_an_address_with_preferred_above_valid_is_not_taken() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _s = start(var c, var out)
+    var adv = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    adv.parts = S_NA
+    let _f = feed(var c, 600, rnd(1000, 9), adv, var out)
+    let _t = dhcp6client.client_tick(var c, 1550, rnd(1000, 3), var out)
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x03E803)
+    rep.parts = S_NA
+    rep.pl = 900
+    rep.vl = 800
+    test.assert_eq(feed(var c, 1600, rnd(1000, 9), rep, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_has_lease(var c), false)
+
+@test
+fn test_a_request_is_repeated_ten_times_and_then_given_up() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _s = start(var c, var out)
+    var adv = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    adv.parts = S_NA
+    let _f = feed(var c, 600, rnd(1000, 9), adv, var out)
+    test.assert_eq(dhcp6client.client_tick(var c, 1550, rnd(1000, 3), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_REQUEST)
+
+    test.case("the timeouts are 1000, 2000, 4000, 8000, 16000, then 30000, the largest")
+    var now = 1550
+    var expected: Vec[Int; 12] = Vec.new()
+    for w in [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000, 30000]
+        let _p = expected.push(w)
+    for i in 0..10
+        test.assert_eq(dhcp6client.client_next_at(var c), now + expected[i])
+        now = now + expected[i]
+        if i < 9
+            test.assert_eq(dhcp6client.client_tick(var c, now, rnd(1000, 3), var out), dhcp6client.DHCP6_ACT_SEND)
+            test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_REQUEST)
+
+    test.case("after the tenth transmission the exchange fails and the client starts again")
+    test.assert_eq(dhcp6client.client_tick(var c, now, rnd(1000, 3), var out), dhcp6client.DHCP6_ACT_FAILED)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_INIT)
+    test.assert_eq(dhcp6client.client_has_lease(var c), false)
+    test.assert_eq(dhcp6client.client_tick(var c, now, rnd(500, 1), var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_STARTING)
+
+@test
+fn test_replies_the_client_must_not_take_for_a_request() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _s = start(var c, var out)
+    var adv = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    adv.parts = S_NA
+    let _f = feed(var c, 600, rnd(1000, 9), adv, var out)
+    let _t = dhcp6client.client_tick(var c, 1550, rnd(1000, 3), var out)
+
+    test.case("a Reply from another server")
+    var other = spec(dhcp6msg.DHCP6_REPLY, 0x03E803)
+    other.parts = S_NA
+    other.who = 2
+    test.assert_eq(feed(var c, 1600, rnd(1000, 9), other, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.case("an Advertise, in the state that waits for a Reply")
+    var adv2 = spec(dhcp6msg.DHCP6_ADVERTISE, 0x03E803)
+    adv2.parts = S_NA
+    test.assert_eq(feed(var c, 1600, rnd(1000, 9), adv2, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.case("a Reply from the server that carries no binding")
+    var empty = spec(dhcp6msg.DHCP6_REPLY, 0x03E803)
+    test.assert_eq(feed(var c, 1600, rnd(1000, 9), empty, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.case("a Reply with an IA_NA that holds a status other than a refusal")
+    var st = spec(dhcp6msg.DHCP6_REPLY, 0x03E803)
+    st.parts = S_NA
+    st.ia_status = dhcp6msg.DHCP6_STATUS_UNSPEC_FAIL
+    test.assert_eq(feed(var c, 1600, rnd(1000, 9), st, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_REQUEST)
+
+    test.case("a Reply that carries NoAddrsAvail at the top refuses the Request")
+    var no = spec(dhcp6msg.DHCP6_REPLY, 0x03E803)
+    no.status = dhcp6msg.DHCP6_STATUS_NO_ADDRS_AVAIL
+    test.assert_eq(feed(var c, 1600, rnd(1000, 9), no, var out), dhcp6client.DHCP6_ACT_REJECTED)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_INIT)
+
+@test
+fn test_a_reply_that_says_not_on_link_or_no_binding_in_the_ia_is_a_refusal() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _s = start(var c, var out)
+    var adv = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    adv.parts = S_NA
+    let _f = feed(var c, 600, rnd(1000, 9), adv, var out)
+    let _t = dhcp6client.client_tick(var c, 1550, rnd(1000, 3), var out)
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x03E803)
+    rep.parts = S_NA
+    rep.ia_status = dhcp6msg.DHCP6_STATUS_NOT_ON_LINK
+    test.assert_eq(feed(var c, 1600, rnd(1000, 9), rep, var out), dhcp6client.DHCP6_ACT_REJECTED)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_INIT)
+    test.assert_eq(dhcp6client.client_next_at(var c), 1600)
+
+// ── Renew, Rebind and the end of the lease ──────────────────────────
+
+@test
+fn test_renew_at_t1_then_rebind_at_t2_then_the_lease_ends() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    test.assert_eq(bind(var c, S_NA, 0, 0, 7200, 10800), dhcp6client.DHCP6_ACT_BOUND)
+    var out: Vec[u8; 1024] = Vec.new()
+    let t1 = 1600 + 3600000
+    let t2 = 1600 + 5760000
+    let end = 1600 + 10800000
+
+    test.case("nothing happens before T1")
+    test.assert_eq(dhcp6client.client_tick(var c, t1 - 1, rnd(1000, 4), var out), dhcp6client.DHCP6_ACT_NONE)
+
+    test.case("at T1 a Renew goes to the multicast address, naming the server and the address")
+    test.assert_eq(dhcp6client.client_tick(var c, t1, rnd(1000, 4), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_RENEW)
+    test.assert_eq(dhcp6client.client_has_lease(var c), true)
+    test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_RENEW)
+    test.assert_eq(dhcp6msg.xid(var out), 0x03E804)
+    var want = server_duid(1)
+    test.assert_eq(dhcp6msg.option_equals_duid(var out, dhcp6msg.find(var out, dhcp6msg.DHCP6_OPT_SERVERID), var want), true)
+    let a = addr_in(var out)
+    test.assert_eq(a >= 0, true)
+    test.assert_eq(dhcp6msg.ip6_eq(dhcp6opt.iaaddr_address(var out, a), leased()), true)
+    test.assert_eq(dhcp6opt.iaaddr_preferred(var out, a), 0)
+    test.assert_eq(dhcp6opt.iaaddr_valid(var out, a), 0)
+    test.assert_eq(dhcp6opt.elapsed_time(var out), 0)
+    test.assert_eq(dhcp6client.client_next_at(var c), t1 + 10000)
+
+    test.case("the Renew is repeated with a doubling timeout up to 600 seconds")
+    test.assert_eq(dhcp6client.client_tick(var c, t1 + 10000, rnd(1000, 4), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_RENEW)
+    test.assert_eq(dhcp6opt.elapsed_time(var out), 1000)
+    test.assert_eq(dhcp6client.client_next_at(var c), t1 + 10000 + 20000)
+
+    test.case("at T2 the client starts a Rebind, which does not name a server")
+    test.assert_eq(dhcp6client.client_tick(var c, t2, rnd(1000, 5), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_REBIND)
+    test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_REBIND)
+    test.assert_eq(dhcp6msg.xid(var out), 0x03E805)
+    test.assert_eq(dhcp6msg.find(var out, dhcp6msg.DHCP6_OPT_SERVERID), -1)
+    test.assert_eq(addr_in(var out) >= 0, true)
+    test.assert_eq(dhcp6client.client_next_at(var c), t2 + 10000)
+
+    test.case("a Rebind is repeated until the lease ends, and then the address is lost")
+    test.assert_eq(dhcp6client.client_tick(var c, end - 1, rnd(1000, 6), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_tick(var c, end, rnd(1000, 6), var out), dhcp6client.DHCP6_ACT_EXPIRED)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_INIT)
+    test.assert_eq(dhcp6client.client_has_lease(var c), false)
+    test.assert_eq(dhcp6client.client_has_address(var c), false)
+    test.assert_eq(dhcp6client.client_next_at(var c), end)
+
+@test
+fn test_a_renew_timeout_stops_at_600_seconds() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    test.assert_eq(bind(var c, S_NA, 0, 0, 100000, 200000), dhcp6client.DHCP6_ACT_BOUND)
+    var out: Vec[u8; 1024] = Vec.new()
+    var now = 1600 + 50000000
+    test.assert_eq(dhcp6client.client_tick(var c, now, rnd(1000, 4), var out), dhcp6client.DHCP6_ACT_SEND)
+    var wait = 10000
+    for _ in 0..7
+        test.assert_eq(dhcp6client.client_next_at(var c), now + wait)
+        now = now + wait
+        test.assert_eq(dhcp6client.client_tick(var c, now, rnd(1000, 4), var out), dhcp6client.DHCP6_ACT_SEND)
+        wait = wait * 2
+        if wait > 600000
+            wait = 600000
+    test.assert_eq(wait, 600000)
+    test.assert_eq(dhcp6client.client_next_at(var c), now + 600000)
+
+@test
+fn test_a_reply_to_a_renew_extends_the_lease() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    test.assert_eq(bind(var c, S_NA, 0, 0, 7200, 10800), dhcp6client.DHCP6_ACT_BOUND)
+    var out: Vec[u8; 1024] = Vec.new()
+    let t1 = 1600 + 3600000
+    let _r = dhcp6client.client_tick(var c, t1, rnd(1000, 4), var out)
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x03E804)
+    rep.parts = S_NA | S_DNS
+    rep.t1 = 7200
+    rep.t2 = 11520
+    rep.pl = 14400
+    rep.vl = 21600
+    test.assert_eq(feed(var c, t1 + 500, rnd(1000, 9), rep, var out), dhcp6client.DHCP6_ACT_BOUND)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_BOUND)
+    test.assert_eq(dhcp6client.client_t1_at(var c), t1 + 500 + 7200000)
+    test.assert_eq(dhcp6client.client_t2_at(var c), t1 + 500 + 11520000)
+    test.assert_eq(dhcp6client.client_expires_at(var c), t1 + 500 + 21600000)
+    test.assert_eq(dhcp6client.client_dns_count(var c), 2)
+
+    test.case("a Renew Reply that carries no DNS option makes the client forget the DNS servers")
+    let t1b = t1 + 500 + 7200000
+    let _r2 = dhcp6client.client_tick(var c, t1b, rnd(1000, 5), var out)
+    var rep2 = spec(dhcp6msg.DHCP6_REPLY, 0x03E805)
+    rep2.parts = S_NA
+    test.assert_eq(feed(var c, t1b + 10, rnd(1000, 9), rep2, var out), dhcp6client.DHCP6_ACT_BOUND)
+    test.assert_eq(dhcp6client.client_dns_count(var c), 0)
+    test.assert_eq(dhcp6client.client_domain_count(var c), 0)
+
+@test
+fn test_a_rebind_reply_may_come_from_any_server() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    test.assert_eq(bind(var c, S_NA, 0, 0, 7200, 10800), dhcp6client.DHCP6_ACT_BOUND)
+    var out: Vec[u8; 1024] = Vec.new()
+    let t1 = 1600 + 3600000
+    let t2 = 1600 + 5760000
+    let _r = dhcp6client.client_tick(var c, t1, rnd(1000, 4), var out)
+
+    test.case("a Reply to a Renew from a server that was not asked is ignored")
+    var stray = spec(dhcp6msg.DHCP6_REPLY, 0x03E804)
+    stray.parts = S_NA
+    stray.who = 2
+    test.assert_eq(feed(var c, t1 + 100, rnd(1000, 9), stray, var out), dhcp6client.DHCP6_ACT_NONE)
+
+    let _b = dhcp6client.client_tick(var c, t2, rnd(1000, 5), var out)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_REBIND)
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x03E805)
+    rep.parts = S_NA
+    rep.who = 2
+    test.assert_eq(feed(var c, t2 + 100, rnd(1000, 9), rep, var out), dhcp6client.DHCP6_ACT_BOUND)
+    test.case("the client now talks to the server that answered")
+    var sd: Vec[u8; 130] = Vec.new()
+    test.assert_eq(dhcp6client.client_server_id(var c, var sd), true)
+    test.assert_eq(sd[9] as Int, 2)
+
+@test
+fn test_a_renew_answered_with_no_binding_loses_the_lease() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    test.assert_eq(bind(var c, S_NA, 0, 0, 7200, 10800), dhcp6client.DHCP6_ACT_BOUND)
+    var out: Vec[u8; 1024] = Vec.new()
+    let t1 = 1600 + 3600000
+    let _r = dhcp6client.client_tick(var c, t1, rnd(1000, 4), var out)
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x03E804)
+    rep.parts = S_NA
+    rep.ia_status = dhcp6msg.DHCP6_STATUS_NO_BINDING
+    test.assert_eq(feed(var c, t1 + 50, rnd(1000, 9), rep, var out), dhcp6client.DHCP6_ACT_REJECTED)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_INIT)
+    test.assert_eq(dhcp6client.client_has_address(var c), false)
+
+@test
+fn test_an_address_with_a_valid_lifetime_of_zero_is_taken_back() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    test.assert_eq(bind(var c, S_NA, 0, 0, 7200, 10800), dhcp6client.DHCP6_ACT_BOUND)
+    var out: Vec[u8; 1024] = Vec.new()
+    let t1 = 1600 + 3600000
+    let _r = dhcp6client.client_tick(var c, t1, rnd(1000, 4), var out)
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x03E804)
+    rep.parts = S_NA
+    rep.pl = 0
+    rep.vl = 0
+    test.assert_eq(feed(var c, t1 + 50, rnd(1000, 9), rep, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_has_address(var c), false)
+
+// ── Server Unicast ──────────────────────────────────────────────────
+
+@test
+fn test_a_server_that_gives_its_address_is_sent_unicast_messages() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _s = start(var c, var out)
+    var adv = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    adv.parts = S_NA | S_UNICAST
+    let _f = feed(var c, 600, rnd(1000, 9), adv, var out)
+    test.assert_eq(dhcp6client.client_tick(var c, 1550, rnd(1000, 3), var out), dhcp6client.DHCP6_ACT_SEND_UNICAST)
+    test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_REQUEST)
+    test.assert_eq(dhcp6client.client_server_address(var c).d, 0x99)
+
+    test.case("UseMulticast sends the same message again to the multicast address")
+    var um = spec(dhcp6msg.DHCP6_REPLY, 0x03E803)
+    um.status = dhcp6msg.DHCP6_STATUS_USE_MULTICAST
+    test.assert_eq(feed(var c, 1600, rnd(1000, 6), um, var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_REQUEST)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_REQUEST)
+    test.assert_eq(dhcp6msg.xid(var out), 0x03E806)
+    test.assert_eq(dhcp6client.client_tick(var c, 2600, rnd(1000, 3), var out), dhcp6client.DHCP6_ACT_SEND)
+
+    test.case("UseMulticast from a server that was already reached by multicast is ignored")
+    var um2 = spec(dhcp6msg.DHCP6_REPLY, 0x03E806)
+    um2.status = dhcp6msg.DHCP6_STATUS_USE_MULTICAST
+    test.assert_eq(feed(var c, 2700, rnd(1000, 6), um2, var out), dhcp6client.DHCP6_ACT_NONE)
+
+@test
+fn test_a_server_unicast_option_in_the_reply_is_kept_for_renewing() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _s = start(var c, var out)
+    var adv = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    adv.parts = S_NA
+    let _f = feed(var c, 600, rnd(1000, 9), adv, var out)
+    let _t = dhcp6client.client_tick(var c, 1550, rnd(1000, 3), var out)
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x03E803)
+    rep.parts = S_NA | S_UNICAST
+    test.assert_eq(feed(var c, 1600, rnd(1000, 9), rep, var out), dhcp6client.DHCP6_ACT_BOUND)
+    let t1 = 1600 + 3600000
+    test.assert_eq(dhcp6client.client_tick(var c, t1, rnd(1000, 4), var out), dhcp6client.DHCP6_ACT_SEND_UNICAST)
+    test.case("a Rebind is always sent to the multicast address")
+    let t2 = 1600 + 5760000
+    test.assert_eq(dhcp6client.client_tick(var c, t2, rnd(1000, 5), var out), dhcp6client.DHCP6_ACT_SEND)
+
+// ── Rapid Commit ────────────────────────────────────────────────────
+
+@test
+fn test_rapid_commit_binds_on_the_reply_to_the_solicit() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA | dhcp6client.DHCP6_RAPID_COMMIT)
+    var out: Vec[u8; 1024] = Vec.new()
+    test.assert_eq(start(var c, var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6opt.has_rapid_commit(var out), true)
+
+    test.case("a Reply without Rapid Commit is ignored")
+    var plain = spec(dhcp6msg.DHCP6_REPLY, 0x01F402)
+    plain.parts = S_NA
+    test.assert_eq(feed(var c, 600, rnd(1000, 9), plain, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.case("a Reply with Rapid Commit and an address binds")
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x01F402)
+    rep.parts = S_NA | S_RAPID
+    test.assert_eq(feed(var c, 650, rnd(1000, 9), rep, var out), dhcp6client.DHCP6_ACT_BOUND)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_BOUND)
+    test.assert_eq(dhcp6client.client_t1_at(var c), 650 + 3600000)
+
+@test
+fn test_a_rapid_commit_reply_with_no_binding_is_not_taken() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA | dhcp6client.DHCP6_RAPID_COMMIT)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _s = start(var c, var out)
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x01F402)
+    rep.parts = S_RAPID
+    test.assert_eq(feed(var c, 650, rnd(1000, 9), rep, var out), dhcp6client.DHCP6_ACT_NONE)
+    var rep2 = spec(dhcp6msg.DHCP6_REPLY, 0x01F402)
+    rep2.parts = S_RAPID | S_NA
+    rep2.status = dhcp6msg.DHCP6_STATUS_UNSPEC_FAIL
+    test.assert_eq(feed(var c, 650, rnd(1000, 9), rep2, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_SOLICIT)
+
+@test
+fn test_a_client_that_did_not_ask_for_rapid_commit_ignores_it() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _s = start(var c, var out)
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x01F402)
+    rep.parts = S_NA | S_RAPID
+    test.assert_eq(feed(var c, 650, rnd(1000, 9), rep, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_SOLICIT)
+
+// ── Prefix delegation ───────────────────────────────────────────────
+
+@test
+fn test_a_client_that_wants_a_prefix_and_an_address_binds_both() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA | dhcp6client.DHCP6_WANT_PD)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _s = start(var c, var out)
+    test.assert_eq(dhcp6opt.find_ia(var out, dhcp6msg.DHCP6_OPT_IA_NA, 1) >= 0, true)
+    test.assert_eq(dhcp6opt.find_ia(var out, dhcp6msg.DHCP6_OPT_IA_PD, 2) >= 0, true)
+
+    var adv = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    adv.parts = S_PD
+    test.assert_eq(feed(var c, 600, rnd(1000, 9), adv, var out), dhcp6client.DHCP6_ACT_NONE)
+    let _t = dhcp6client.client_tick(var c, 1550, rnd(1000, 3), var out)
+    test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_REQUEST)
+
+    test.case("the Reply grants an address of 7200 seconds and a prefix of 3600: T1 is the earlier")
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x03E803)
+    rep.parts = S_NA | S_PD
+    rep.pl = 7200
+    rep.vl = 10800
+    rep.ppl = 3600
+    rep.pvl = 5400
+    test.assert_eq(feed(var c, 1600, rnd(1000, 9), rep, var out), dhcp6client.DHCP6_ACT_BOUND)
+    test.assert_eq(dhcp6client.client_has_address(var c), true)
+    test.assert_eq(dhcp6client.client_has_prefix(var c), true)
+    test.assert_eq(dhcp6client.client_prefix_length(var c), 56)
+    test.assert_eq(dhcp6msg.ip6_eq(dhcp6client.client_prefix(var c), delegated()), true)
+    test.assert_eq(dhcp6client.client_t1_at(var c), 1600 + 1800000)
+
+    test.case("a Renew carries both associations, each with what it holds")
+    test.assert_eq(dhcp6client.client_tick(var c, 1600 + 1800000, rnd(1000, 4), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(addr_in(var out) >= 0, true)
+    let pd = dhcp6opt.find_ia(var out, dhcp6msg.DHCP6_OPT_IA_PD, 2)
+    let p = dhcp6msg.find_option(var out, dhcp6opt.ia_options_start(pd), dhcp6msg.opt_end(var out, pd), dhcp6msg.DHCP6_OPT_IAPREFIX, 0)
+    test.assert_eq(dhcp6opt.iaprefix_length(var out, p), 56)
+    test.assert_eq(dhcp6opt.iaprefix_valid(var out, p), 0)
+
+@test
+fn test_t1_is_the_earliest_of_two_ias_and_the_lease_ends_with_the_longest() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA | dhcp6client.DHCP6_WANT_PD)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _s = start(var c, var out)
+    var adv = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    adv.parts = S_NA | S_PD
+    let _f = feed(var c, 600, rnd(1000, 9), adv, var out)
+    let _t = dhcp6client.client_tick(var c, 1550, rnd(1000, 3), var out)
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x03E803)
+    rep.parts = S_NA | S_PD
+    rep.t1 = 100
+    rep.t2 = 200
+    rep.pl = 300
+    rep.vl = 1000
+    rep.pt1 = 50
+    rep.pt2 = 400
+    rep.ppl = 300
+    rep.pvl = 2000
+    let _r = feed(var c, 1600, rnd(1000, 9), rep, var out)
+    test.assert_eq(dhcp6client.client_t1_at(var c), 1600 + 50000)
+    test.assert_eq(dhcp6client.client_t2_at(var c), 1600 + 200000)
+    test.assert_eq(dhcp6client.client_expires_at(var c), 1600 + 2000000)
+
+@test
+fn test_a_client_wants_only_what_it_asked_for() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_PD)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _s = start(var c, var out)
+    test.assert_eq(dhcp6opt.find_ia(var out, dhcp6msg.DHCP6_OPT_IA_NA, 1), -1)
+    test.assert_eq(dhcp6opt.find_ia(var out, dhcp6msg.DHCP6_OPT_IA_PD, 2) >= 0, true)
+    var adv = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    adv.parts = S_NA
+    test.assert_eq(feed(var c, 600, rnd(1000, 9), adv, var out), dhcp6client.DHCP6_ACT_NONE)
+
+// ── Release and Decline ─────────────────────────────────────────────
+
+@test
+fn test_release_gives_the_lease_back_and_waits_for_the_reply() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA | dhcp6client.DHCP6_WANT_PD)
+    test.assert_eq(bind(var c, S_NA | S_PD, 0, 0, 7200, 10800), dhcp6client.DHCP6_ACT_BOUND)
+    var out: Vec[u8; 1024] = Vec.new()
+
+    test.assert_eq(dhcp6client.client_release(var c, 5000, rnd(1000, 6), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_RELEASE)
+    test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_RELEASE)
+    test.assert_eq(dhcp6msg.xid(var out), 0x03E806)
+    test.assert_eq(dhcp6msg.find(var out, dhcp6msg.DHCP6_OPT_SERVERID) >= 0, true)
+    test.assert_eq(addr_in(var out) >= 0, true)
+    test.assert_eq(dhcp6opt.find_ia(var out, dhcp6msg.DHCP6_OPT_IA_PD, 2) >= 0, true)
+    test.assert_eq(dhcp6opt.oro_count(var out), 0)
+    test.assert_eq(dhcp6client.client_next_at(var c), 5000 + 1000)
+
+    test.case("a Reply from the server ends it")
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x03E806)
+    test.assert_eq(feed(var c, 5100, rnd(1000, 9), rep, var out), dhcp6client.DHCP6_ACT_RELEASED)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_IDLE)
+    test.assert_eq(dhcp6client.client_has_lease(var c), false)
+    test.assert_eq(dhcp6client.client_next_at(var c), -1)
+    test.assert_eq(dhcp6client.client_tick(var c, 999999, rnd(1000, 9), var out), dhcp6client.DHCP6_ACT_NONE)
+
+    test.case("restart takes an idle client back to INIT")
+    dhcp6client.client_restart(var c)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_INIT)
+
+@test
+fn test_a_release_that_nobody_answers_ends_after_four_transmissions() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    test.assert_eq(bind(var c, S_NA, 0, 0, 7200, 10800), dhcp6client.DHCP6_ACT_BOUND)
+    var out: Vec[u8; 1024] = Vec.new()
+    test.assert_eq(dhcp6client.client_release(var c, 5000, rnd(1000, 6), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_next_at(var c), 6000)
+    test.assert_eq(dhcp6client.client_tick(var c, 6000, rnd(1000, 6), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_next_at(var c), 8000)
+    test.assert_eq(dhcp6client.client_tick(var c, 8000, rnd(1000, 6), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_next_at(var c), 12000)
+    test.assert_eq(dhcp6client.client_tick(var c, 12000, rnd(1000, 6), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_next_at(var c), 20000)
+    test.assert_eq(dhcp6client.client_tick(var c, 20000, rnd(1000, 6), var out), dhcp6client.DHCP6_ACT_RELEASED)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_IDLE)
+
+@test
+fn test_release_and_decline_need_a_lease_and_a_server() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    var out: Vec[u8; 1024] = Vec.new()
+    test.assert_eq(dhcp6client.client_release(var c, 0, rnd(1000, 6), var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_decline(var c, 0, rnd(1000, 6), var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_confirm(var c, 0, rnd(1000, 6)), false)
+    test.assert_eq(out.len(), 0)
+
+    test.case("a client that wants only a prefix cannot decline")
+    var p = new_client(dhcp6client.DHCP6_WANT_PD)
+    test.assert_eq(bind(var p, S_PD, 0, 0, 7200, 10800), dhcp6client.DHCP6_ACT_BOUND)
+    test.assert_eq(dhcp6client.client_decline(var p, 5000, rnd(1000, 6), var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_confirm(var p, 5000, rnd(1000, 6)), false)
+
+@test
+fn test_decline_reports_the_address_and_not_the_prefix() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA | dhcp6client.DHCP6_WANT_PD)
+    test.assert_eq(bind(var c, S_NA | S_PD, 0, 0, 7200, 10800), dhcp6client.DHCP6_ACT_BOUND)
+    var out: Vec[u8; 1024] = Vec.new()
+    test.assert_eq(dhcp6client.client_decline(var c, 5000, rnd(1000, 7), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_DECLINE)
+    test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_DECLINE)
+    test.assert_eq(addr_in(var out) >= 0, true)
+    test.assert_eq(dhcp6opt.find_ia(var out, dhcp6msg.DHCP6_OPT_IA_PD, 2), -1)
+    test.assert_eq(dhcp6client.client_has_lease(var c), true)
+
+    test.case("the Reply ends it, and a Reply from another server does not")
+    var other = spec(dhcp6msg.DHCP6_REPLY, 0x03E807)
+    other.who = 2
+    test.assert_eq(feed(var c, 5100, rnd(1000, 9), other, var out), dhcp6client.DHCP6_ACT_NONE)
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x03E807)
+    test.assert_eq(feed(var c, 5200, rnd(1000, 9), rep, var out), dhcp6client.DHCP6_ACT_RELEASED)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_IDLE)
+
+@test
+fn test_a_decline_nobody_answers_ends_after_four_transmissions() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    test.assert_eq(bind(var c, S_NA, 0, 0, 7200, 10800), dhcp6client.DHCP6_ACT_BOUND)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _d = dhcp6client.client_decline(var c, 5000, rnd(1000, 7), var out)
+    var now = 5000
+    var wait = 1000
+    for _ in 0..3
+        now = now + wait
+        test.assert_eq(dhcp6client.client_tick(var c, now, rnd(1000, 7), var out), dhcp6client.DHCP6_ACT_SEND)
+        wait = wait * 2
+    now = now + wait
+    test.assert_eq(dhcp6client.client_tick(var c, now, rnd(1000, 7), var out), dhcp6client.DHCP6_ACT_RELEASED)
+
+@test
+fn test_a_release_goes_unicast_when_the_server_gave_its_address() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    test.assert_eq(bind(var c, S_NA | S_UNICAST, 0, 0, 7200, 10800), dhcp6client.DHCP6_ACT_BOUND)
+    var out: Vec[u8; 1024] = Vec.new()
+    test.assert_eq(dhcp6client.client_release(var c, 5000, rnd(1000, 6), var out), dhcp6client.DHCP6_ACT_SEND_UNICAST)
+
+// ── Confirm ─────────────────────────────────────────────────────────
+
+@test
+fn test_confirm_asks_whether_the_address_is_still_on_the_link() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    test.assert_eq(bind(var c, S_NA, 0, 0, 7200, 10800), dhcp6client.DHCP6_ACT_BOUND)
+    var out: Vec[u8; 1024] = Vec.new()
+    test.assert_eq(dhcp6client.client_confirm(var c, 5000, rnd(500, 1)), true)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_STARTING)
+    test.assert_eq(dhcp6client.client_next_at(var c), 5500)
+    test.assert_eq(dhcp6client.client_tick(var c, 5499, rnd(1000, 6), var out), dhcp6client.DHCP6_ACT_NONE)
+
+    test.assert_eq(dhcp6client.client_tick(var c, 5500, rnd(1000, 6), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_CONFIRM)
+    test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_CONFIRM)
+    test.assert_eq(dhcp6msg.xid(var out), 0x03E806)
+    test.assert_eq(dhcp6msg.find(var out, dhcp6msg.DHCP6_OPT_SERVERID), -1)
+    test.assert_eq(addr_in(var out) >= 0, true)
+    test.assert_eq(dhcp6opt.oro_count(var out), 0)
+    test.assert_eq(dhcp6client.client_has_lease(var c), true)
+    test.assert_eq(dhcp6client.client_next_at(var c), 5500 + 1000)
+
+    test.case("a Reply with Success confirms, and the lease keeps its times")
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x03E806)
+    rep.who = 2
+    test.assert_eq(feed(var c, 5600, rnd(1000, 9), rep, var out), dhcp6client.DHCP6_ACT_CONFIRMED)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_BOUND)
+    test.assert_eq(dhcp6client.client_t1_at(var c), 1600 + 3600000)
+
+@test
+fn test_confirm_answered_not_on_link_loses_the_address() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    test.assert_eq(bind(var c, S_NA, 0, 0, 7200, 10800), dhcp6client.DHCP6_ACT_BOUND)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _a = dhcp6client.client_confirm(var c, 5000, rnd(500, 1))
+    let _b = dhcp6client.client_tick(var c, 5500, rnd(1000, 6), var out)
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x03E806)
+    rep.status = dhcp6msg.DHCP6_STATUS_NOT_ON_LINK
+    test.assert_eq(feed(var c, 5600, rnd(1000, 9), rep, var out), dhcp6client.DHCP6_ACT_REJECTED)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_INIT)
+    test.assert_eq(dhcp6client.client_has_address(var c), false)
+
+@test
+fn test_confirm_with_another_status_is_ignored_and_no_answer_keeps_the_lease() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    test.assert_eq(bind(var c, S_NA, 0, 0, 7200, 10800), dhcp6client.DHCP6_ACT_BOUND)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _a = dhcp6client.client_confirm(var c, 5000, rnd(500, 1))
+    let _b = dhcp6client.client_tick(var c, 5500, rnd(1000, 6), var out)
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x03E806)
+    rep.status = dhcp6msg.DHCP6_STATUS_UNSPEC_FAIL
+    test.assert_eq(feed(var c, 5600, rnd(1000, 9), rep, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_CONFIRM)
+
+    test.case("the timeouts are 1000, 2000 and 4000 and then 4000 again, up to ten seconds in all")
+    test.assert_eq(dhcp6client.client_tick(var c, 6500, rnd(1000, 6), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_next_at(var c), 6500 + 2000)
+    test.assert_eq(dhcp6client.client_tick(var c, 8500, rnd(1000, 6), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_next_at(var c), 8500 + 4000)
+    test.assert_eq(dhcp6client.client_tick(var c, 12500, rnd(1000, 6), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.case("after ten seconds from the first Confirm the client goes back to using its lease")
+    test.assert_eq(dhcp6client.client_tick(var c, 15500, rnd(1000, 6), var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_BOUND)
+    test.assert_eq(dhcp6client.client_has_address(var c), true)
+    test.assert_eq(dhcp6client.client_next_at(var c), 1600 + 3600000)
+
+// ── Information-request ─────────────────────────────────────────────
+
+@test
+fn test_a_stateless_client_asks_for_parameters_and_refreshes_them() [io]
+    var c = new_client(dhcp6client.DHCP6_STATELESS)
+    var out: Vec[u8; 1024] = Vec.new()
+    test.assert_eq(dhcp6client.client_tick(var c, 0, rnd(500, 1), var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_tick(var c, 500, rnd(500, 2), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_INFORM)
+    test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_INFORMATION_REQUEST)
+    test.assert_eq(dhcp6msg.xid(var out), 0x01F402)
+    test.assert_eq(dhcp6msg.find(var out, dhcp6msg.DHCP6_OPT_CLIENTID) >= 0, true)
+    test.assert_eq(dhcp6msg.find(var out, dhcp6msg.DHCP6_OPT_SERVERID), -1)
+    test.assert_eq(dhcp6opt.find_ia(var out, dhcp6msg.DHCP6_OPT_IA_NA, 1), -1)
+    test.assert_eq(dhcp6opt.find_ia(var out, dhcp6msg.DHCP6_OPT_IA_PD, 2), -1)
+    test.assert_eq(dhcp6opt.oro_contains(var out, 83), true)
+    test.assert_eq(dhcp6opt.oro_contains(var out, 32), true)
+    test.assert_eq(dhcp6opt.oro_contains(var out, 23), true)
+    test.assert_eq(dhcp6opt.oro_contains(var out, 82), false)
+    test.assert_eq(dhcp6opt.elapsed_time(var out), 0)
+    test.assert_eq(dhcp6client.client_next_at(var c), 500 + 950)
+
+    test.case("the Reply sets the parameters and the refresh time")
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x01F402)
+    rep.parts = S_DNS | S_DOMAIN | S_NTP | S_REFRESH | S_MAX_RT
+    test.assert_eq(feed(var c, 700, rnd(1000, 9), rep, var out), dhcp6client.DHCP6_ACT_INFORMED)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_INFORMED)
+    test.assert_eq(dhcp6client.client_dns_count(var c), 2)
+    test.assert_eq(dhcp6client.client_domain_count(var c), 2)
+    test.assert_eq(dhcp6client.client_ntp(var c).d, 0x123)
+    test.assert_eq(dhcp6client.client_has_lease(var c), false)
+    test.assert_eq(dhcp6client.client_next_at(var c), 700 + 3600000)
+
+    test.case("when the refresh time ends a new Information-request goes")
+    test.assert_eq(dhcp6client.client_tick(var c, 700 + 3599999, rnd(1000, 3), var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_tick(var c, 700 + 3600000, rnd(1000, 3), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_INFORMATION_REQUEST)
+    test.assert_eq(dhcp6msg.xid(var out), 0x03E803)
+
+@test
+fn test_information_request_replies_the_client_must_ignore() [io]
+    var c = new_client(dhcp6client.DHCP6_STATELESS)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _a = dhcp6client.client_tick(var c, 0, rnd(500, 1), var out)
+    let _b = dhcp6client.client_tick(var c, 500, rnd(500, 2), var out)
+    var bad = spec(dhcp6msg.DHCP6_REPLY, 0x01F402)
+    bad.status = dhcp6msg.DHCP6_STATUS_UNSPEC_FAIL
+    test.assert_eq(feed(var c, 700, rnd(1000, 9), bad, var out), dhcp6client.DHCP6_ACT_NONE)
+    var adv = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    test.assert_eq(feed(var c, 700, rnd(1000, 9), adv, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_INFORM)
+
+    test.case("a refresh time under ten minutes is held at ten minutes")
+    var m: Vec[u8; 1024] = Vec.new()
+    var s = spec(dhcp6msg.DHCP6_REPLY, 0x01F402)
+    let _ok = srv(s, var m)
+    let _t = dhcp6msg.put_info_refresh_time(var m, 5)
+    test.assert_eq(dhcp6client.client_receive(var c, 800, rnd(1000, 9), var m, var out), dhcp6client.DHCP6_ACT_INFORMED)
+    test.assert_eq(dhcp6client.client_next_at(var c), 800 + 600000)
+
+@test
+fn test_information_request_timeouts_use_inf_max_rt() [io]
+    var c = new_client(dhcp6client.DHCP6_STATELESS)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _a = dhcp6client.client_tick(var c, 0, rnd(1000, 1), var out)
+    let _b = dhcp6client.client_tick(var c, 1000, rnd(1000, 2), var out)
+    test.assert_eq(dhcp6client.client_next_at(var c), 1000 + 1000)
+    test.assert_eq(dhcp6client.client_tick(var c, 2000, rnd(1000, 2), var out), dhcp6client.DHCP6_ACT_SEND)
+    test.assert_eq(dhcp6client.client_next_at(var c), 2000 + 2000)
+
+// ── SOL_MAX_RT ──────────────────────────────────────────────────────
+
+@test
+fn test_sol_max_rt_from_a_server_caps_the_solicit_timeout() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _s = start(var c, var out)
+    test.case("an Advertise that is ignored for what it holds still sets SOL_MAX_RT")
+    var adv = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    adv.parts = S_MAX_RT
+    test.assert_eq(feed(var c, 600, rnd(1000, 9), adv, var out), dhcp6client.DHCP6_ACT_NONE)
+    var now = 1550
+    var rt = 1050
+    for _ in 0..8
+        test.assert_eq(dhcp6client.client_tick(var c, now, rnd(1000, 3), var out), dhcp6client.DHCP6_ACT_SEND)
+        rt = rt * 2
+        if rt > 60000
+            rt = 60000
+        test.assert_eq(dhcp6client.client_next_at(var c), now + rt)
+        now = now + rt
+    test.assert_eq(rt, 60000)
+
+// ── What the stages share ───────────────────────────────────────────
+
+@test
+fn test_a_tick_before_the_time_does_nothing_in_every_state() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _s = start(var c, var out)
+    test.assert_eq(dhcp6client.client_tick(var c, 1000, rnd(1000, 3), var out), dhcp6client.DHCP6_ACT_NONE)
+    var d = new_client(dhcp6client.DHCP6_WANT_NA)
+    let _b = bind(var d, S_NA, 0, 0, 7200, 10800)
+    test.assert_eq(dhcp6client.client_tick(var d, 2000, rnd(1000, 3), var out), dhcp6client.DHCP6_ACT_NONE)
+    let _r = dhcp6client.client_tick(var d, 1600 + 3600000, rnd(1000, 4), var out)
+    test.assert_eq(dhcp6client.client_tick(var d, 1600 + 3600001, rnd(1000, 4), var out), dhcp6client.DHCP6_ACT_NONE)
+
+@test
+fn test_a_reconfigure_message_is_ignored_in_every_state() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    test.assert_eq(bind(var c, S_NA, 0, 0, 7200, 10800), dhcp6client.DHCP6_ACT_BOUND)
+    var out: Vec[u8; 1024] = Vec.new()
+    var m: Vec[u8; 1024] = Vec.new()
+    let s = spec(dhcp6msg.DHCP6_RECONFIGURE, 0x03E803)
+    let _ok = srv(s, var m)
+    let _k = dhcp6msg.put_reconfigure_message(var m, dhcp6msg.DHCP6_RENEW)
+    test.assert_eq(dhcp6client.client_receive(var c, 2000, 0, var m, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_BOUND)
+    test.case("a Reply in BOUND, with no exchange out, is ignored")
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x03E803)
+    rep.parts = S_NA
+    test.assert_eq(feed(var c, 2000, rnd(1000, 9), rep, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.case("and so is one in INIT")
+    var d = new_client(dhcp6client.DHCP6_WANT_NA)
+    test.assert_eq(feed(var d, 2000, rnd(1000, 9), rep, var out), dhcp6client.DHCP6_ACT_NONE)
+
+@test
+fn test_client_restart_forgets_everything_it_held() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA | dhcp6client.DHCP6_WANT_PD)
+    test.assert_eq(bind(var c, S_NA | S_PD | S_UNICAST, 0, 0, 7200, 10800), dhcp6client.DHCP6_ACT_BOUND)
+    dhcp6client.client_restart(var c)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_INIT)
+    test.assert_eq(dhcp6client.client_has_lease(var c), false)
+    test.assert_eq(dhcp6client.client_has_address(var c), false)
+    test.assert_eq(dhcp6client.client_has_prefix(var c), false)
+    var sd: Vec[u8; 130] = Vec.new()
+    test.assert_eq(dhcp6client.client_server_id(var c, var sd), false)
+    test.assert_eq(sd.len(), 0)
+    test.assert_eq(dhcp6client.client_next_at(var c), 0)
+    test.assert_eq(dhcp6client.client_remaining(var c, 100), 0)
+
+@test
+fn test_the_numbers_of_section_7_6_are_the_defaults() [io]
+    test.assert_eq(dhcp6client.DHCP6_SOL_MAX_DELAY, 1000)
+    test.assert_eq(dhcp6client.DHCP6_SOL_TIMEOUT, 1000)
+    test.assert_eq(dhcp6client.DHCP6_SOL_MAX_RT, 3600000)
+    test.assert_eq(dhcp6client.DHCP6_REQ_TIMEOUT, 1000)
+    test.assert_eq(dhcp6client.DHCP6_REQ_MAX_RT, 30000)
+    test.assert_eq(dhcp6client.DHCP6_REQ_MAX_RC, 10)
+    test.assert_eq(dhcp6client.DHCP6_CNF_MAX_DELAY, 1000)
+    test.assert_eq(dhcp6client.DHCP6_CNF_TIMEOUT, 1000)
+    test.assert_eq(dhcp6client.DHCP6_CNF_MAX_RT, 4000)
+    test.assert_eq(dhcp6client.DHCP6_CNF_MAX_RD, 10000)
+    test.assert_eq(dhcp6client.DHCP6_REN_TIMEOUT, 10000)
+    test.assert_eq(dhcp6client.DHCP6_REN_MAX_RT, 600000)
+    test.assert_eq(dhcp6client.DHCP6_REB_TIMEOUT, 10000)
+    test.assert_eq(dhcp6client.DHCP6_REB_MAX_RT, 600000)
+    test.assert_eq(dhcp6client.DHCP6_INF_MAX_DELAY, 1000)
+    test.assert_eq(dhcp6client.DHCP6_INF_TIMEOUT, 1000)
+    test.assert_eq(dhcp6client.DHCP6_INF_MAX_RT, 3600000)
+    test.assert_eq(dhcp6client.DHCP6_REL_TIMEOUT, 1000)
+    test.assert_eq(dhcp6client.DHCP6_REL_MAX_RC, 4)
+    test.assert_eq(dhcp6client.DHCP6_DEC_TIMEOUT, 1000)
+    test.assert_eq(dhcp6client.DHCP6_DEC_MAX_RC, 4)
+
+// ── Cases the lists and refusals leave ──────────────────────────────
+
+// A Reply for the Request of `bind`, with a Domain Search List option
+// holding the raw bytes in `raw` after the usual parts.
+fn bind_with_domain_bytes(var c: dhcp6client.Dhcp6Client, raw: [Int]) -> Int
+    var out: Vec[u8; 1024] = Vec.new()
+    let _s = start(var c, var out)
+    var adv = spec(dhcp6msg.DHCP6_ADVERTISE, 0x01F402)
+    adv.parts = S_NA
+    let _f = feed(var c, 600, rnd(1000, 9), adv, var out)
+    let _t = dhcp6client.client_tick(var c, 1550, rnd(1000, 3), var out)
+    var m: Vec[u8; 1024] = Vec.new()
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x03E803)
+    rep.parts = S_NA
+    let _ok = srv(rep, var m)
+    let dl = dhcp6msg.open_option(var m, dhcp6msg.DHCP6_OPT_DOMAIN_LIST)
+    for b in raw
+        let _p = dhcp6msg.put_u8(var m, b)
+    let _c = dhcp6msg.close_option(var m, dl)
+    dhcp6client.client_receive(var c, 1600, rnd(1000, 9), m, var out)
+
+@test
+fn test_the_domain_list_of_a_lease_is_read_name_by_name() [io]
+    test.case("the root alone is one dot")
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    test.assert_eq(bind_with_domain_bytes(var c, [0]), dhcp6client.DHCP6_ACT_BOUND)
+    test.assert_eq(dhcp6client.client_domain_count(var c), 1)
+    var text: Vec[u8; 256] = Vec.new()
+    test.assert_eq(dhcp6client.client_domain_text(var c, 0, var text), true)
+    test.assert_eq(text.len(), 1)
+    test.assert_eq(text[0] as Int, 0x2e)
+
+    test.case("a name with no terminating zero is not a name")
+    var d = new_client(dhcp6client.DHCP6_WANT_NA)
+    test.assert_eq(bind_with_domain_bytes(var d, [3, 0x61, 0x62, 0x63]), dhcp6client.DHCP6_ACT_BOUND)
+    test.assert_eq(dhcp6client.client_domain_count(var d), 0)
+    test.assert_eq(dhcp6client.client_domain_text(var d, 0, var text), false)
+
+    test.case("a compression pointer is not allowed in this option")
+    var e = new_client(dhcp6client.DHCP6_WANT_NA)
+    test.assert_eq(bind_with_domain_bytes(var e, [0xc0, 0x0c, 0]), dhcp6client.DHCP6_ACT_BOUND)
+    test.assert_eq(dhcp6client.client_domain_count(var e), 0)
+
+    test.case("a good name followed by a bad one counts the good one")
+    var f = new_client(dhcp6client.DHCP6_WANT_NA)
+    test.assert_eq(bind_with_domain_bytes(var f, [1, 0x61, 0, 1, 0x62, 9]), dhcp6client.DHCP6_ACT_BOUND)
+    test.assert_eq(dhcp6client.client_domain_count(var f), 1)
+    test.assert_eq(dhcp6client.client_domain_text(var f, 0, var text), true)
+    test.assert_eq(text.len(), 1)
+
+    test.case("a list longer than the 128 bytes the client keeps is dropped whole")
+    var g = new_client(dhcp6client.DHCP6_WANT_NA)
+    var big: [Int] = []
+    for _ in 0..70
+        big = list.append(big, [1, 0x61])
+    big = list.append(big, [0])
+    test.assert_eq(bind_with_domain_bytes(var g, big), dhcp6client.DHCP6_ACT_BOUND)
+    test.assert_eq(dhcp6client.client_domain_count(var g), 0)
+
+@test
+fn test_a_refusal_of_the_prefix_is_a_refusal() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_PD)
+    test.assert_eq(bind(var c, S_PD, 0, 0, 7200, 10800), dhcp6client.DHCP6_ACT_BOUND)
+    var out: Vec[u8; 1024] = Vec.new()
+    let t1 = 1600 + 3600000
+    let _r = dhcp6client.client_tick(var c, t1, rnd(1000, 4), var out)
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x03E804)
+    rep.parts = S_PD
+    rep.ia_status = dhcp6msg.DHCP6_STATUS_NO_BINDING
+    test.assert_eq(feed(var c, t1 + 50, rnd(1000, 9), rep, var out), dhcp6client.DHCP6_ACT_REJECTED)
+    test.assert_eq(dhcp6client.client_has_prefix(var c), false)
+
+@test
+fn test_a_failure_status_in_a_reply_to_a_renew_is_waited_out() [io]
+    var c = new_client(dhcp6client.DHCP6_WANT_NA)
+    test.assert_eq(bind(var c, S_NA, 0, 0, 7200, 10800), dhcp6client.DHCP6_ACT_BOUND)
+    var out: Vec[u8; 1024] = Vec.new()
+    let t1 = 1600 + 3600000
+    let _r = dhcp6client.client_tick(var c, t1, rnd(1000, 4), var out)
+    var rep = spec(dhcp6msg.DHCP6_REPLY, 0x03E804)
+    rep.status = dhcp6msg.DHCP6_STATUS_UNSPEC_FAIL
+    test.assert_eq(feed(var c, t1 + 50, rnd(1000, 9), rep, var out), dhcp6client.DHCP6_ACT_NONE)
+    test.assert_eq(dhcp6client.client_state(var c), dhcp6client.DHCP6_STATE_RENEW)
+    test.assert_eq(dhcp6client.client_has_address(var c), true)

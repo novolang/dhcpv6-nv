@@ -72,6 +72,10 @@ fn test_options_are_found_by_code_and_by_position() [io]
     test.assert_eq(dhcp6msg.count_options(var m, 4, m.len(), dhcp6msg.DHCP6_OPT_CLIENTID), 1)
     test.assert_eq(dhcp6msg.count_options(var m, 4, m.len(), 99), 0)
 
+    test.case("an end past the message is held to the message")
+    test.assert_eq(dhcp6msg.find_option(var m, 4, 5000, dhcp6msg.DHCP6_OPT_RAPID_COMMIT, 0), 50)
+    test.assert_eq(dhcp6msg.find_option(var m, 4, 5000, 99, 0), -1)
+
     test.case("a search inside an option sees only that option's area")
     test.assert_eq(dhcp6msg.find_option(var m, 22, 28, dhcp6msg.DHCP6_OPT_CLIENTID, 0), -1)
     test.assert_eq(dhcp6msg.find_option(var m, -1, m.len(), dhcp6msg.DHCP6_OPT_CLIENTID, 0), -1)

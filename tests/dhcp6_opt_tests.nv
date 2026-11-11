@@ -337,6 +337,13 @@ fn test_dns_servers_of_the_wrong_length_are_not_read() [io]
 
 // ── Domain names ────────────────────────────────────────────────────
 
+// `n` labels of 63 letters a, each with its length byte, as hexadecimal text.
+fn full_labels(n: Int) -> Str
+    var s = ""
+    for _ in 0..n
+        s = s + "3f" + "61".repeat(63)
+    s
+
 fn text_of(var m: Vec[u8; 1024], at: Int, hi: Int) -> Str
     var out: Vec[u8; 256] = Vec.new()
     if dhcp6opt.domain_text(var m, at, hi, var out)
@@ -386,6 +393,15 @@ fn test_a_malformed_name_stops_the_list() [io]
     test.case("a good name then a bad one: the good one is counted")
     var e = load("07000001" + "00180006" + "016100" + "01620a")
     test.assert_eq(dhcp6opt.domain_count(var e, 4), 1)
+    test.case("a name longer than 255 bytes in label form is refused, one of 255 is not")
+    var long = load("07000001" + "0018" + "0140" + full_labels(4) + "3e" + "61".repeat(62) + "00")
+    test.assert_eq(dhcp6opt.domain_count(var long, 4), 0)
+    var ok255 = load("07000001" + "0018" + "00ff" + full_labels(3) + "3d" + "61".repeat(61) + "00")
+    test.assert_eq(dhcp6opt.domain_count(var ok255, 4), 1)
+    var out2: Vec[u8; 256] = Vec.new()
+    test.assert_eq(dhcp6opt.domain_text(var ok255, 8, dhcp6msg.opt_end(var ok255, 4), var out2), true)
+    test.assert_eq(out2.len(), 3 * 63 + 61 + 3)
+
     test.case("an offset that is not an option")
     test.assert_eq(dhcp6opt.domain_nth(var e, -1, 0), -1)
     test.assert_eq(dhcp6opt.domain_next(var e, -1, 5), -1)

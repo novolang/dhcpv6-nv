@@ -416,7 +416,8 @@ fn put_dns_servers(var m: Vec[u8; 1024], var servers: Vec[dhcp6msg.Ip6; 8]) -> B
 // The offset after the domain name that starts at `at`, in the label
 // form of RFC 1035 section 3.1 with no compression, read inside the
 // area that ends at `hi`; or -1 when a label is longer than 63 bytes, is
-// a compression pointer, or runs past `hi`.
+// a compression pointer, runs past `hi`, or makes the name longer than
+// the 255 bytes RFC 1035 allows.
 pub @tier(embedded)
 @no_alloc
 fn domain_next(var m: Vec[u8; 1024], at: Int, hi: Int) -> Int
@@ -432,7 +433,7 @@ fn domain_next(var m: Vec[u8; 1024], at: Int, hi: Int) -> Int
                 if len == 0
                     result = pos + 1
                     live = false
-                elif len > 63 or pos + 1 + len >= hi
+                elif len > 63 or pos + 1 + len >= hi or pos + 2 + len - at > 255
                     live = false
                 else
                     pos = pos + 1 + len
@@ -476,8 +477,8 @@ fn domain_count(var m: Vec[u8; 1024], o: Int) -> Int
 
 // The domain name at `at` as text with the labels joined by dots and no
 // trailing dot, written into `out` (replacing its content); the root is
-// written as one dot.  Answers false when the name is malformed or the
-// text would not fit in 255 bytes.
+// written as one dot.  Answers false when the name is malformed.  A name
+// is at most 255 bytes in label form, so its text always fits.
 pub @tier(embedded)
 @no_alloc
 fn domain_text(var m: Vec[u8; 1024], at: Int, hi: Int, var out: Vec[u8; 256]) -> Bool
@@ -487,28 +488,19 @@ fn domain_text(var m: Vec[u8; 1024], at: Int, hi: Int, var out: Vec[u8; 256]) ->
         false
     else
         var pos = at
-        var ok = true
         var first = true
         for _ in 0..130
             if pos < end - 1
                 let len = dhcp6msg.u8_at(var m, pos)
                 if not first
-                    ok = ok and push_char(var out, 46)
+                    let _d = out.push(46 as u8)
                 first = false
                 for j in 0..len
-                    ok = ok and push_char(var out, dhcp6msg.u8_at(var m, pos + 1 + j))
+                    let _p = out.push(m[pos + 1 + j])
                 pos = pos + 1 + len
         if first
-            ok = push_char(var out, 46)
-        ok
-
-// Append one byte to a text buffer.
-@tier(embedded)
-@no_alloc
-fn push_char(var out: Vec[u8; 256], v: Int) -> Bool
-    match out.push((v & 255) as u8)
-        Ok(_)  => true
-        Err(_) => false
+            let _r = out.push(46 as u8)
+        true
 
 // Append the name written in `text` as dotted ASCII, such as
 // `example.com` with or without a closing dot, to the message in the

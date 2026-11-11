@@ -1,0 +1,582 @@
+// dhcp6_msg_tests.nv — the message of RFC 8415, byte by byte: the client
+// and server header, the relay header, the option walk, the faults a
+// received message can have, the writers, the DUIDs and the multicast
+// addresses.
+//
+// The vectors are written out by hand.  Each one names its fields beside
+// the bytes that carry them.
+
+use std.test
+use std.bytes
+use dhcp6msg
+
+// A message from hexadecimal text.
+fn load(hex: Str) -> Vec[u8; 1024]
+    var m: Vec[u8; 1024] = Vec.new()
+    for b in bytes.to_byte_list(bytes.from_hex(hex) ?? bytes.zeros(0))
+        let _p = m.push(b)
+    m
+
+// Whether two messages hold the same bytes.
+fn same(var a: Vec[u8; 1024], var b: Vec[u8; 1024]) -> Bool
+    var eq = a.len() == b.len()
+    for i in 0..a.len()
+        if i < b.len() and a[i] != b[i]
+            eq = false
+    eq
+
+// A SOLICIT from the client with the DUID-LL 00:11:22:33:44:55, written
+// out by hand.
+//
+//   01 abcdef                       SOLICIT, transaction 0xabcdef
+//   0001 000a                       Client Identifier, 10 bytes
+//     0003 0001 001122334455          DUID-LL, hardware type 1, the MAC
+//   0003 000c                       IA_NA, 12 bytes
+//     00000001 00000000 00000000      IAID 1, T1 0, T2 0
+//   0008 0002 0000                  Elapsed Time 0
+//   0006 0006 0017 0018 0052        Option Request: 23, 24, 82
+//   000e 0000                       Rapid Commit
+fn solicit_hex() -> Str
+    "01abcdef" + "0001000a00030001001122334455" + "0003000c" + "000000010000000000000000" + "000800020000" + "00060006001700180052" + "000e0000"
+
+@test
+fn test_the_header_of_a_solicit() [io]
+    var m = load(solicit_hex())
+    test.assert_eq(m.len(), 4 + 14 + 16 + 6 + 10 + 4)
+    test.assert_eq(dhcp6msg.msg_type(var m), dhcp6msg.DHCP6_SOLICIT)
+    test.assert_eq(dhcp6msg.xid(var m), 0xabcdef)
+    test.assert_eq(dhcp6msg.is_relay(var m), false)
+    test.assert_eq(dhcp6msg.options_start(var m), 4)
+    test.assert_eq(dhcp6msg.options_end(var m), m.len())
+    test.assert_eq(dhcp6msg.validate(var m), dhcp6msg.DHCP6_FAULT_NONE)
+
+@test
+fn test_options_are_found_by_code_and_by_position() [io]
+    var m = load(solicit_hex())
+    test.assert_eq(dhcp6msg.find(var m, dhcp6msg.DHCP6_OPT_CLIENTID), 4)
+    test.assert_eq(dhcp6msg.find(var m, dhcp6msg.DHCP6_OPT_IA_NA), 18)
+    test.assert_eq(dhcp6msg.find(var m, dhcp6msg.DHCP6_OPT_ELAPSED_TIME), 34)
+    test.assert_eq(dhcp6msg.find(var m, dhcp6msg.DHCP6_OPT_ORO), 40)
+    test.assert_eq(dhcp6msg.find(var m, dhcp6msg.DHCP6_OPT_RAPID_COMMIT), 50)
+    test.assert_eq(dhcp6msg.find(var m, dhcp6msg.DHCP6_OPT_SERVERID), -1)
+
+    test.case("the data of an option starts after its four-byte header")
+    test.assert_eq(dhcp6msg.opt_code(var m, 4), 1)
+    test.assert_eq(dhcp6msg.opt_len(var m, 4), 10)
+    test.assert_eq(dhcp6msg.opt_data(4), 8)
+    test.assert_eq(dhcp6msg.opt_end(var m, 4), 18)
+
+    test.case("the second option with a code, and a count")
+    test.assert_eq(dhcp6msg.find_option(var m, 4, m.len(), dhcp6msg.DHCP6_OPT_IA_NA, 1), -1)
+    test.assert_eq(dhcp6msg.count_options(var m, 4, m.len(), dhcp6msg.DHCP6_OPT_IA_NA), 1)
+    test.assert_eq(dhcp6msg.count_options(var m, 4, m.len(), dhcp6msg.DHCP6_OPT_CLIENTID), 1)
+    test.assert_eq(dhcp6msg.count_options(var m, 4, m.len(), 99), 0)
+
+    test.case("a search inside an option sees only that option's area")
+    test.assert_eq(dhcp6msg.find_option(var m, 22, 28, dhcp6msg.DHCP6_OPT_CLIENTID, 0), -1)
+    test.assert_eq(dhcp6msg.find_option(var m, -1, m.len(), dhcp6msg.DHCP6_OPT_CLIENTID, 0), -1)
+
+@test
+fn test_the_numbers_have_their_names() [io]
+    test.assert_eq(dhcp6msg.type_name(1), "SOLICIT")
+    test.assert_eq(dhcp6msg.type_name(2), "ADVERTISE")
+    test.assert_eq(dhcp6msg.type_name(3), "REQUEST")
+    test.assert_eq(dhcp6msg.type_name(4), "CONFIRM")
+    test.assert_eq(dhcp6msg.type_name(5), "RENEW")
+    test.assert_eq(dhcp6msg.type_name(6), "REBIND")
+    test.assert_eq(dhcp6msg.type_name(7), "REPLY")
+    test.assert_eq(dhcp6msg.type_name(8), "RELEASE")
+    test.assert_eq(dhcp6msg.type_name(9), "DECLINE")
+    test.assert_eq(dhcp6msg.type_name(10), "RECONFIGURE")
+    test.assert_eq(dhcp6msg.type_name(11), "INFORMATION-REQUEST")
+    test.assert_eq(dhcp6msg.type_name(12), "RELAY-FORW")
+    test.assert_eq(dhcp6msg.type_name(13), "RELAY-REPL")
+    test.assert_eq(dhcp6msg.type_name(0), "unknown message type")
+    test.assert_eq(dhcp6msg.status_name(0), "Success")
+    test.assert_eq(dhcp6msg.status_name(1), "UnspecFail")
+    test.assert_eq(dhcp6msg.status_name(2), "NoAddrsAvail")
+    test.assert_eq(dhcp6msg.status_name(3), "NoBinding")
+    test.assert_eq(dhcp6msg.status_name(4), "NotOnLink")
+    test.assert_eq(dhcp6msg.status_name(5), "UseMulticast")
+    test.assert_eq(dhcp6msg.status_name(6), "NoPrefixAvail")
+    test.assert_eq(dhcp6msg.status_name(7), "unknown status")
+    test.assert_eq(dhcp6msg.fault_name(0), "no fault")
+    test.assert_eq(dhcp6msg.fault_name(1), "the message is shorter than its header")
+    test.assert_eq(dhcp6msg.fault_name(2), "the message type is not 1 to 13")
+    test.assert_eq(dhcp6msg.fault_name(3), "an option runs past the end of its area")
+    test.assert_eq(dhcp6msg.fault_name(9), "unknown fault")
+
+@test
+fn test_a_message_is_refused_for_the_fault_it_has() [io]
+    test.case("shorter than a header")
+    var a = load("01abcd")
+    test.assert_eq(dhcp6msg.validate(var a), dhcp6msg.DHCP6_FAULT_SHORT)
+    var none = load("")
+    test.assert_eq(dhcp6msg.validate(var none), dhcp6msg.DHCP6_FAULT_SHORT)
+
+    test.case("a type that is not 1 to 13")
+    var b = load("00abcdef")
+    test.assert_eq(dhcp6msg.validate(var b), dhcp6msg.DHCP6_FAULT_TYPE)
+    var c = load("0eabcdef")
+    test.assert_eq(dhcp6msg.validate(var c), dhcp6msg.DHCP6_FAULT_TYPE)
+    var ok = load("0dabcdef")
+    test.assert_eq(dhcp6msg.validate(var ok), dhcp6msg.DHCP6_FAULT_SHORT)
+
+    test.case("a relay message shorter than its 34-byte header")
+    var r = load("0c00" + "00".repeat(30))
+    test.assert_eq(dhcp6msg.validate(var r), dhcp6msg.DHCP6_FAULT_SHORT)
+
+    test.case("an option that runs past the end")
+    var d = load("01abcdef" + "0001000a0003")
+    test.assert_eq(dhcp6msg.validate(var d), dhcp6msg.DHCP6_FAULT_OPTION)
+    test.case("an option header cut off after its code")
+    var e = load("01abcdef" + "0001")
+    test.assert_eq(dhcp6msg.validate(var e), dhcp6msg.DHCP6_FAULT_OPTION)
+    test.case("a message with no options is valid")
+    var f = load("01abcdef")
+    test.assert_eq(dhcp6msg.validate(var f), dhcp6msg.DHCP6_FAULT_NONE)
+
+@test
+fn test_every_prefix_of_a_message_is_read_without_a_trap() [io]
+    var full = load(solicit_hex())
+    for n in 0..full.len()
+        var cut: Vec[u8; 1024] = Vec.new()
+        for i in 0..n
+            let _p = cut.push(full[i])
+        let _v = dhcp6msg.validate(var cut)
+        let _a = dhcp6msg.find(var cut, dhcp6msg.DHCP6_OPT_IA_NA)
+        let _b = dhcp6msg.xid(var cut)
+        let _c = dhcp6msg.relay_link_address(var cut)
+    test.assert_eq(full.len(), 54)
+
+// A RELAY-FORW from a relay agent, carrying the client's SOLICIT.
+//
+//   0c 00                             RELAY-FORW, hop count 0
+//   20010db8 00010000 00000000 00000001  link address 2001:db8:1::1
+//   fe800000 00000000 00000000 00000001  peer address fe80::1
+//   0009 0018                         Relay Message, 24 bytes
+//     01 112233                         SOLICIT, transaction 0x112233
+//     0001 000a 00030001001122334455      Client Identifier
+//     0008 0002 0000                      Elapsed Time
+//   0012 0004 65746830                Interface-Id "eth0"
+fn relay_hex() -> Str
+    "0c00" + "20010db8000100000000000000000001" + "fe800000000000000000000000000001" + "00090018" + "01112233" + "0001000a00030001001122334455" + "000800020000" + "0012000465746830"
+
+@test
+fn test_the_relay_form_is_read() [io]
+    var m = load(relay_hex())
+    test.assert_eq(m.len(), 34 + 28 + 8)
+    test.assert_eq(dhcp6msg.validate(var m), dhcp6msg.DHCP6_FAULT_NONE)
+    test.assert_eq(dhcp6msg.is_relay(var m), true)
+    test.assert_eq(dhcp6msg.msg_type(var m), dhcp6msg.DHCP6_RELAY_FORW)
+    test.assert_eq(dhcp6msg.relay_hop_count(var m), 0)
+    test.assert_eq(dhcp6msg.options_start(var m), 34)
+
+    test.case("the link and peer addresses")
+    let link = dhcp6msg.relay_link_address(var m)
+    test.assert_eq(link.a, 0x20010db8)
+    test.assert_eq(link.b, 0x00010000)
+    test.assert_eq(link.c, 0)
+    test.assert_eq(link.d, 1)
+    let peer = dhcp6msg.relay_peer_address(var m)
+    test.assert_eq(peer.a, 0xfe800000)
+    test.assert_eq(peer.d, 1)
+    test.assert_eq(dhcp6msg.ip6_octet(link, 0), 0x20)
+    test.assert_eq(dhcp6msg.ip6_octet(link, 3), 0xb8)
+    test.assert_eq(dhcp6msg.ip6_octet(link, 5), 0x01)
+    test.assert_eq(dhcp6msg.ip6_octet(link, 11), 0)
+    test.assert_eq(dhcp6msg.ip6_octet(link, 15), 1)
+    test.assert_eq(dhcp6msg.ip6_octet(link, 16), 0)
+    test.assert_eq(dhcp6msg.ip6_octet(link, -1), 0)
+
+    test.case("the carried message is copied out and is a SOLICIT")
+    var inner: Vec[u8; 1024] = Vec.new()
+    test.assert_eq(dhcp6msg.relay_inner(var m, var inner), true)
+    test.assert_eq(inner.len(), 24)
+    test.assert_eq(dhcp6msg.msg_type(var inner), dhcp6msg.DHCP6_SOLICIT)
+    test.assert_eq(dhcp6msg.xid(var inner), 0x112233)
+    test.assert_eq(dhcp6msg.validate(var inner), dhcp6msg.DHCP6_FAULT_NONE)
+
+    test.case("the Interface-Id is the four bytes eth0")
+    let ifid = dhcp6msg.find(var m, dhcp6msg.DHCP6_OPT_INTERFACE_ID)
+    test.assert_eq(dhcp6msg.opt_len(var m, ifid), 4)
+    test.assert_eq(dhcp6msg.u32_at(var m, dhcp6msg.opt_data(ifid)), 0x65746830)
+
+    test.case("a message that is not a relay message carries nothing")
+    var plain = load(solicit_hex())
+    var none: Vec[u8; 1024] = Vec.new()
+    test.assert_eq(dhcp6msg.relay_inner(var plain, var none), false)
+    test.assert_eq(none.len(), 0)
+    test.case("a relay message with no Relay Message option")
+    var bare = load("0d01" + "00".repeat(32))
+    test.assert_eq(dhcp6msg.relay_inner(var bare, var none), false)
+    test.assert_eq(dhcp6msg.relay_hop_count(var bare), 1)
+
+@test
+fn test_the_relay_writers_build_what_the_reader_reads() [io]
+    var inner = load("01112233" + "0001000a00030001001122334455" + "000800020000")
+    var out: Vec[u8; 1024] = Vec.new()
+    var ok = dhcp6msg.begin_relay(var out, dhcp6msg.DHCP6_RELAY_FORW, 0,
+        dhcp6msg.ip6(0x20010db8, 0x00010000, 0, 1), dhcp6msg.ip6(0xfe800000, 0, 0, 1))
+    ok = ok and dhcp6msg.put_relay_message(var out, var inner)
+    var ifid: Vec[u8; 128] = Vec.new()
+    for b in [0x65, 0x74, 0x68, 0x30]
+        let _p = ifid.push(b as u8)
+    ok = ok and dhcp6msg.put_interface_id(var out, var ifid)
+    test.assert_eq(ok, true)
+    var want = load(relay_hex())
+    test.assert_eq(same(var out, var want), true)
+
+    test.case("a relay message wrapped in another keeps its hop count")
+    var outer: Vec[u8; 1024] = Vec.new()
+    var ok2 = dhcp6msg.begin_relay(var outer, dhcp6msg.DHCP6_RELAY_FORW, 1,
+        dhcp6msg.ip6(0x20010db8, 0x00020000, 0, 1), dhcp6msg.ip6(0xfe800000, 0, 0, 2))
+    ok2 = ok2 and dhcp6msg.put_relay_message(var outer, var out)
+    test.assert_eq(ok2, true)
+    test.assert_eq(dhcp6msg.relay_hop_count(var outer), 1)
+    var peeled: Vec[u8; 1024] = Vec.new()
+    test.assert_eq(dhcp6msg.relay_inner(var outer, var peeled), true)
+    test.assert_eq(dhcp6msg.relay_hop_count(var peeled), 0)
+    test.assert_eq(same(var peeled, var out), true)
+
+@test
+fn test_a_relay_message_of_the_full_buffer_does_not_fit() [io]
+    var big: Vec[u8; 1024] = Vec.new()
+    let _b = dhcp6msg.begin(var big, dhcp6msg.DHCP6_SOLICIT, 1)
+    for _ in 0..1020
+        let _p = big.push(0 as u8)
+    var out: Vec[u8; 1024] = Vec.new()
+    let _r = dhcp6msg.begin_relay(var out, dhcp6msg.DHCP6_RELAY_FORW, 0, dhcp6msg.ip6_zero(), dhcp6msg.ip6_zero())
+    test.assert_eq(dhcp6msg.put_relay_message(var out, var big), false)
+
+@test
+fn test_the_writers_build_a_solicit_byte_for_byte() [io]
+    var duid: Vec[u8; 130] = Vec.new()
+    var ll: Vec[u8; 128] = Vec.new()
+    for b in [0x00, 0x11, 0x22, 0x33, 0x44, 0x55]
+        let _p = ll.push(b as u8)
+    test.assert_eq(dhcp6msg.duid_ll(var duid, 1, var ll), true)
+    var out: Vec[u8; 1024] = Vec.new()
+    var ok = dhcp6msg.begin(var out, dhcp6msg.DHCP6_SOLICIT, 0xabcdef)
+    ok = ok and dhcp6msg.put_client_id(var out, var duid)
+    let ia = dhcp6msg.open_ia_na(var out, 1, 0, 0)
+    ok = ok and dhcp6msg.close_option(var out, ia)
+    ok = ok and dhcp6msg.put_elapsed_time(var out, 0)
+    var codes: Vec[u16; 16] = Vec.new()
+    for c in [23, 24, 82]
+        let _p = codes.push(c as u16)
+    ok = ok and dhcp6msg.put_option_request(var out, var codes)
+    ok = ok and dhcp6msg.put_rapid_commit(var out)
+    test.assert_eq(ok, true)
+    var want = load(solicit_hex())
+    test.assert_eq(same(var out, var want), true)
+
+@test
+fn test_the_small_option_writers() [io]
+    var m: Vec[u8; 1024] = Vec.new()
+    let _b = dhcp6msg.begin(var m, dhcp6msg.DHCP6_ADVERTISE, 0x010203)
+    test.assert_eq(dhcp6msg.msg_type(var m), 2)
+    test.assert_eq(dhcp6msg.xid(var m), 0x010203)
+    test.assert_eq(dhcp6msg.put_preference(var m, 255), true)
+    test.assert_eq(dhcp6msg.put_option_u8(var m, 200, 7), true)
+    test.assert_eq(dhcp6msg.put_option_u16(var m, 201, 0x1234), true)
+    test.assert_eq(dhcp6msg.put_option_u32(var m, 202, 0x01020304), true)
+    test.assert_eq(dhcp6msg.put_option_empty(var m, 203), true)
+    test.assert_eq(dhcp6msg.put_server_unicast(var m, dhcp6msg.ip6(0x20010db8, 0, 0, 5)), true)
+    test.assert_eq(dhcp6msg.put_info_refresh_time(var m, 3600), true)
+    test.assert_eq(dhcp6msg.put_sol_max_rt(var m, 120), true)
+    test.assert_eq(dhcp6msg.put_inf_max_rt(var m, 130), true)
+    test.assert_eq(dhcp6msg.put_reconfigure_message(var m, dhcp6msg.DHCP6_RENEW), true)
+    test.assert_eq(dhcp6msg.put_reconfigure_accept(var m), true)
+    test.assert_eq(dhcp6msg.put_status_code(var m, 5), true)
+    test.assert_eq(dhcp6msg.validate(var m), dhcp6msg.DHCP6_FAULT_NONE)
+
+    let p = dhcp6msg.find(var m, dhcp6msg.DHCP6_OPT_PREFERENCE)
+    test.assert_eq(p, 4)
+    test.assert_eq(dhcp6msg.u8_at(var m, dhcp6msg.opt_data(p)), 255)
+    let o16 = dhcp6msg.find(var m, 201)
+    test.assert_eq(dhcp6msg.opt_len(var m, o16), 2)
+    test.assert_eq(dhcp6msg.u16_at(var m, dhcp6msg.opt_data(o16)), 0x1234)
+    let o32 = dhcp6msg.find(var m, 202)
+    test.assert_eq(dhcp6msg.u32_at(var m, dhcp6msg.opt_data(o32)), 0x01020304)
+    test.assert_eq(dhcp6msg.opt_len(var m, dhcp6msg.find(var m, 203)), 0)
+    test.assert_eq(dhcp6msg.u24_at(var m, 1), 0x010203)
+
+    test.case("a time that is more than 16 bits is held at 65535, and a negative one at 0")
+    var e: Vec[u8; 1024] = Vec.new()
+    let _b2 = dhcp6msg.begin(var e, dhcp6msg.DHCP6_REQUEST, 1)
+    test.assert_eq(dhcp6msg.put_elapsed_time(var e, 70000), true)
+    test.assert_eq(dhcp6msg.put_elapsed_time(var e, -5), true)
+    test.assert_eq(dhcp6msg.u16_at(var e, 8), 65535)
+    test.assert_eq(dhcp6msg.u16_at(var e, 14), 0)
+
+@test
+fn test_status_code_with_a_message() [io]
+    var m: Vec[u8; 1024] = Vec.new()
+    let _b = dhcp6msg.begin(var m, dhcp6msg.DHCP6_REPLY, 5)
+    var text: Vec[u8; 128] = Vec.new()
+    for c in [0x6e, 0x6f, 0x20, 0x61, 0x64, 0x64, 0x72]
+        let _p = text.push(c as u8)
+    test.assert_eq(dhcp6msg.put_status_message(var m, 2, var text), true)
+    let o = dhcp6msg.find(var m, dhcp6msg.DHCP6_OPT_STATUS_CODE)
+    test.assert_eq(dhcp6msg.opt_len(var m, o), 9)
+    test.assert_eq(dhcp6msg.u16_at(var m, dhcp6msg.opt_data(o)), 2)
+    test.assert_eq(dhcp6msg.u8_at(var m, o + 6), 0x6e)
+    test.assert_eq(dhcp6msg.u8_at(var m, o + 12), 0x72)
+
+@test
+fn test_an_option_is_nested_by_open_and_close() [io]
+    var m: Vec[u8; 1024] = Vec.new()
+    let _b = dhcp6msg.begin(var m, dhcp6msg.DHCP6_REPLY, 5)
+    let ia = dhcp6msg.open_ia_na(var m, 7, 100, 200)
+    test.assert_eq(ia, 4)
+    test.assert_eq(dhcp6msg.put_ia_addr(var m, dhcp6msg.ip6(0x20010db8, 0, 0, 1), 300, 400), true)
+    test.assert_eq(dhcp6msg.put_status_code(var m, 0), true)
+    test.assert_eq(dhcp6msg.close_option(var m, ia), true)
+    test.assert_eq(dhcp6msg.opt_len(var m, ia), 12 + 28 + 6)
+    test.assert_eq(m.len(), 4 + 4 + 12 + 28 + 6)
+    test.assert_eq(dhcp6msg.validate(var m), dhcp6msg.DHCP6_FAULT_NONE)
+    let a = dhcp6msg.find_option(var m, 20, dhcp6msg.opt_end(var m, ia), dhcp6msg.DHCP6_OPT_IAADDR, 0)
+    test.assert_eq(a, 20)
+    test.assert_eq(dhcp6msg.opt_len(var m, a), 24)
+
+    test.case("an option opened inside another closes first")
+    var n: Vec[u8; 1024] = Vec.new()
+    let _b2 = dhcp6msg.begin(var n, dhcp6msg.DHCP6_REPLY, 5)
+    let outer = dhcp6msg.open_option(var n, 300)
+    let inner = dhcp6msg.open_option(var n, 301)
+    test.assert_eq(dhcp6msg.put_u16(var n, 0xBEEF), true)
+    test.assert_eq(dhcp6msg.close_option(var n, inner), true)
+    test.assert_eq(dhcp6msg.close_option(var n, outer), true)
+    test.assert_eq(dhcp6msg.opt_len(var n, outer), 6)
+    test.assert_eq(dhcp6msg.opt_len(var n, inner), 2)
+
+    test.case("an offset that open_option did not answer is refused")
+    test.assert_eq(dhcp6msg.close_option(var n, -1), false)
+    test.assert_eq(dhcp6msg.close_option(var n, 1000), false)
+
+@test
+fn test_a_full_buffer_makes_every_writer_answer_false() [io]
+    var m: Vec[u8; 1024] = Vec.new()
+    for _ in 0..1022
+        let _p = m.push(0 as u8)
+    test.assert_eq(dhcp6msg.put_u32(var m, 1), false)
+    var m2: Vec[u8; 1024] = Vec.new()
+    for _ in 0..1023
+        let _p = m2.push(0 as u8)
+    test.assert_eq(dhcp6msg.put_u16(var m2, 1), false)
+    var m3: Vec[u8; 1024] = Vec.new()
+    for _ in 0..1020
+        let _p = m3.push(0 as u8)
+    test.assert_eq(dhcp6msg.open_option(var m3, 5), 1020)
+    test.assert_eq(dhcp6msg.open_option(var m3, 5), -1)
+    var m4: Vec[u8; 1024] = Vec.new()
+    for _ in 0..1021
+        let _p = m4.push(0 as u8)
+    test.assert_eq(dhcp6msg.open_ia_na(var m4, 1, 0, 0), -1)
+    var m5: Vec[u8; 1024] = Vec.new()
+    for _ in 0..1018
+        let _p = m5.push(0 as u8)
+    test.assert_eq(dhcp6msg.open_ia_pd(var m5, 1, 0, 0), -1)
+    var m6: Vec[u8; 1024] = Vec.new()
+    for _ in 0..1018
+        let _p = m6.push(0 as u8)
+    test.assert_eq(dhcp6msg.open_ia_ta(var m6, 1), -1)
+    test.assert_eq(dhcp6msg.begin(var m6, 1, 1), true)
+
+@test
+fn test_ia_ta_has_only_an_identifier() [io]
+    var m: Vec[u8; 1024] = Vec.new()
+    let _b = dhcp6msg.begin(var m, dhcp6msg.DHCP6_SOLICIT, 9)
+    let ia = dhcp6msg.open_ia_ta(var m, 0x01020304)
+    test.assert_eq(dhcp6msg.put_ia_addr(var m, dhcp6msg.ip6(0x20010db8, 0, 0, 2), 10, 20), true)
+    test.assert_eq(dhcp6msg.close_option(var m, ia), true)
+    test.assert_eq(dhcp6msg.opt_code(var m, ia), dhcp6msg.DHCP6_OPT_IA_TA)
+    test.assert_eq(dhcp6msg.opt_len(var m, ia), 4 + 28)
+    test.assert_eq(dhcp6msg.u32_at(var m, ia + 4), 0x01020304)
+
+// Whether two DUIDs hold the same bytes.
+fn same_duid(var a: Vec[u8; 130], var b: Vec[u8; 130]) -> Bool
+    var eq = a.len() == b.len()
+    for i in 0..a.len()
+        if i < b.len() and a[i] != b[i]
+            eq = false
+    eq
+
+// ── DUIDs ───────────────────────────────────────────────────────────
+
+@test
+fn test_the_four_duid_types_are_built_as_the_rfcs_lay_them_out() [io]
+    var ll: Vec[u8; 128] = Vec.new()
+    for b in [0x00, 0x11, 0x22, 0x33, 0x44, 0x55]
+        let _p = ll.push(b as u8)
+    var d: Vec[u8; 130] = Vec.new()
+
+    test.case("DUID-LLT: type 1, hardware type, a time, the address")
+    test.assert_eq(dhcp6msg.duid_llt(var d, 1, 0x3a2b1c0d, var ll), true)
+    test.assert_eq(d.len(), 14)
+    test.assert_eq(dhcp6msg.duid_type(var d), dhcp6msg.DHCP6_DUID_LLT)
+    var want: Vec[u8; 130] = Vec.new()
+    for b in [0x00, 0x01, 0x00, 0x01, 0x3a, 0x2b, 0x1c, 0x0d, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55]
+        let _p = want.push(b as u8)
+    test.assert_eq(same_duid(var d, var want), true)
+
+    test.case("DUID-EN: type 2, a four-byte enterprise number, an identifier")
+    var id: Vec[u8; 128] = Vec.new()
+    for b in [0xde, 0xad, 0xbe, 0xef]
+        let _p = id.push(b as u8)
+    test.assert_eq(dhcp6msg.duid_en(var d, 9, var id), true)
+    test.assert_eq(d.len(), 10)
+    test.assert_eq(dhcp6msg.duid_type(var d), dhcp6msg.DHCP6_DUID_EN)
+    test.assert_eq(d[2] as Int, 0)
+    test.assert_eq(d[5] as Int, 9)
+    test.assert_eq(d[6] as Int, 0xde)
+
+    test.case("DUID-LL: type 3, hardware type, the address")
+    test.assert_eq(dhcp6msg.duid_ll(var d, 1, var ll), true)
+    test.assert_eq(d.len(), 10)
+    test.assert_eq(dhcp6msg.duid_type(var d), dhcp6msg.DHCP6_DUID_LL)
+
+    test.case("DUID-UUID: type 4 and exactly sixteen bytes (RFC 6355)")
+    var uuid: Vec[u8; 128] = Vec.new()
+    for i in 0..16
+        let _p = uuid.push((0x10 + i) as u8)
+    test.assert_eq(dhcp6msg.duid_uuid(var d, var uuid), true)
+    test.assert_eq(d.len(), 18)
+    test.assert_eq(dhcp6msg.duid_type(var d), dhcp6msg.DHCP6_DUID_UUID)
+    test.assert_eq(d[17] as Int, 0x1f)
+    let _p15 = uuid.push(0 as u8)
+    test.assert_eq(dhcp6msg.duid_uuid(var d, var uuid), false)
+
+    test.case("the type of an empty or one-byte DUID is 0")
+    var tiny: Vec[u8; 130] = Vec.new()
+    test.assert_eq(dhcp6msg.duid_type(var tiny), 0)
+    let _q = tiny.push(1 as u8)
+    test.assert_eq(dhcp6msg.duid_type(var tiny), 0)
+
+@test
+fn test_a_duid_that_does_not_fit_is_refused() [io]
+    var d: Vec[u8; 130] = Vec.new()
+    var ll: Vec[u8; 128] = Vec.new()
+    for _ in 0..128
+        let _p = ll.push(7 as u8)
+    test.assert_eq(dhcp6msg.duid_ll(var d, 1, var ll), false)
+    test.assert_eq(dhcp6msg.duid_llt(var d, 1, 1, var ll), false)
+    test.assert_eq(dhcp6msg.duid_en(var d, 1, var ll), false)
+    var id: Vec[u8; 128] = Vec.new()
+    for _ in 0..124
+        let _p = id.push(7 as u8)
+    test.assert_eq(dhcp6msg.duid_en(var d, 1, var id), true)
+    test.assert_eq(d.len(), 130)
+    let _pz = id.push(0 as u8)
+    test.assert_eq(dhcp6msg.duid_en(var d, 1, var id), false)
+
+@test
+fn test_a_duid_is_read_out_of_an_option_and_compared() [io]
+    var m = load(solicit_hex())
+    var d: Vec[u8; 130] = Vec.new()
+    test.assert_eq(dhcp6msg.read_duid(var m, 4, var d), true)
+    test.assert_eq(d.len(), 10)
+    test.assert_eq(dhcp6msg.option_equals_duid(var m, 4, var d), true)
+    test.assert_eq(dhcp6msg.duid_type(var d), 3)
+    let _s = d.push(0 as u8)
+    test.assert_eq(dhcp6msg.option_equals_duid(var m, 4, var d), false)
+    var d2: Vec[u8; 130] = Vec.new()
+    for i in 0..10
+        let _p = d2.push(m[8 + i])
+    d2[9] = 0x56 as u8
+    test.assert_eq(dhcp6msg.option_equals_duid(var m, 4, var d2), false)
+    test.assert_eq(dhcp6msg.option_equals_duid(var m, -1, var d2), false)
+
+    test.case("an option longer than a DUID, or one past the message, is not read")
+    var big = load("02000001" + "0002" + "0083" + "00".repeat(131))
+    test.assert_eq(dhcp6msg.read_duid(var big, 4, var d), false)
+    test.assert_eq(d.len(), 0)
+    var cut = load("02000001" + "0002" + "0010" + "00".repeat(3))
+    test.assert_eq(dhcp6msg.read_duid(var cut, 4, var d), false)
+    test.assert_eq(dhcp6msg.read_duid(var cut, -4, var d), false)
+
+// ── Addresses ───────────────────────────────────────────────────────
+
+@test
+fn test_addresses_are_four_words_and_compare_as_a_whole() [io]
+    let a = dhcp6msg.ip6(0x20010DB8, 0, 0, 1)
+    let b = dhcp6msg.ip6(0x20010DB8, 0, 0, 1)
+    let c = dhcp6msg.ip6(0x20010DB8, 0, 1, 1)
+    test.assert_eq(dhcp6msg.ip6_eq(a, b), true)
+    test.assert_eq(dhcp6msg.ip6_eq(a, c), false)
+    test.assert_eq(dhcp6msg.ip6_eq(dhcp6msg.ip6(1, 0, 0, 0), dhcp6msg.ip6(0, 1, 0, 0)), false)
+    test.assert_eq(dhcp6msg.ip6_eq(dhcp6msg.ip6(0, 0, 0, 1), dhcp6msg.ip6(0, 0, 1, 0)), false)
+    test.assert_eq(dhcp6msg.ip6_eq(dhcp6msg.ip6(0, 1, 0, 0), dhcp6msg.ip6(0, 0, 0, 0)), false)
+    test.assert_eq(dhcp6msg.ip6_is_zero(dhcp6msg.ip6_zero()), true)
+    test.assert_eq(dhcp6msg.ip6_is_zero(a), false)
+    test.assert_eq(dhcp6msg.ip6_is_zero(dhcp6msg.ip6(0, 0, 0, 1)), false)
+    test.assert_eq(dhcp6msg.ip6_is_zero(dhcp6msg.ip6(0, 0, 1, 0)), false)
+    test.assert_eq(dhcp6msg.ip6_is_zero(dhcp6msg.ip6(0, 1, 0, 0)), false)
+
+    test.case("a word is reduced to its low 32 bits")
+    let w = dhcp6msg.ip6(0x1FFFFFFFF, 0, 0, 0)
+    test.assert_eq(w.a, 0xFFFFFFFF)
+
+    test.case("the octets of an address, left to right")
+    let x = dhcp6msg.ip6(0x01020304, 0x05060708, 0x090A0B0C, 0x0D0E0F10)
+    for i in 0..16
+        test.assert_eq(dhcp6msg.ip6_octet(x, i), i + 1)
+
+    test.case("an address is written and read back")
+    var m: Vec[u8; 1024] = Vec.new()
+    test.assert_eq(dhcp6msg.put_ip6(var m, x), true)
+    test.assert_eq(m.len(), 16)
+    test.assert_eq(dhcp6msg.ip6_eq(dhcp6msg.ip6_at(var m, 0), x), true)
+    test.assert_eq(dhcp6msg.ip6_at(var m, 8).a, 0x090A0B0C)
+    test.assert_eq(dhcp6msg.ip6_at(var m, 12).a, 0x0D0E0F10)
+    test.assert_eq(dhcp6msg.ip6_at(var m, 12).b, 0)
+
+@test
+fn test_the_multicast_addresses_and_ports() [io]
+    let s = dhcp6msg.all_relay_agents_and_servers()
+    test.assert_eq(s.a, 0xFF020000)
+    test.assert_eq(s.b, 0)
+    test.assert_eq(s.c, 0)
+    test.assert_eq(s.d, 0x00010002)
+    let t = dhcp6msg.all_servers()
+    test.assert_eq(t.a, 0xFF050000)
+    test.assert_eq(t.d, 0x00010003)
+    test.assert_eq(dhcp6msg.DHCP6_CLIENT_PORT, 546)
+    test.assert_eq(dhcp6msg.DHCP6_SERVER_PORT, 547)
+    test.assert_eq(dhcp6msg.DHCP6_HOP_COUNT_LIMIT, 8)
+
+@test
+fn test_numbers_the_format_fixes() [io]
+    test.assert_eq(dhcp6msg.DHCP6_MESSAGE_MAX, 1024)
+    test.assert_eq(dhcp6msg.DHCP6_HEADER_LEN, 4)
+    test.assert_eq(dhcp6msg.DHCP6_RELAY_HEADER_LEN, 34)
+    test.assert_eq(dhcp6msg.DHCP6_DUID_MAX, 130)
+    test.assert_eq(dhcp6msg.DHCP6_INFINITY, 4294967295)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_CLIENTID, 1)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_SERVERID, 2)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_IA_NA, 3)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_IA_TA, 4)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_IAADDR, 5)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_ORO, 6)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_PREFERENCE, 7)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_ELAPSED_TIME, 8)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_RELAY_MSG, 9)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_AUTH, 11)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_UNICAST, 12)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_STATUS_CODE, 13)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_RAPID_COMMIT, 14)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_USER_CLASS, 15)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_VENDOR_CLASS, 16)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_VENDOR_OPTS, 17)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_INTERFACE_ID, 18)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_RECONF_MSG, 19)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_RECONF_ACCEPT, 20)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_DNS_SERVERS, 23)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_DOMAIN_LIST, 24)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_IA_PD, 25)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_IAPREFIX, 26)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_INFO_REFRESH_TIME, 32)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_NTP_SERVER, 56)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_SOL_MAX_RT, 82)
+    test.assert_eq(dhcp6msg.DHCP6_OPT_INF_MAX_RT, 83)

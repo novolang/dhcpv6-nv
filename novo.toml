@@ -1,0 +1,21 @@
+[package]
+name        = "dhcpv6-nv"
+version     = "0.1.0"
+description = "DHCPv6 (RFC 8415) for a device with no heap: the message and the relay form in a fixed buffer, the options of RFC 8415, RFC 3646, RFC 5908 and RFC 6355, and the client of section 18.2 as a step the caller drives with its own clock and random numbers.  The relay agent and the server are not included."
+license     = "Apache-2.0"
+
+stability   = "experimental"
+
+layer       = "core"
+
+category    = "networking"
+
+tags        = ["dhcpv6", "dhcp", "rfc8415", "ipv6", "duid", "prefix-delegation", "sans-io", "embedded", "no-alloc"]
+repository  = "https://github.com/novolang/dhcpv6-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.1"
+
+[docs.pages]
+"README.md" = "Addresses and prefixes for a device with no heap"
+
+[dependencies]

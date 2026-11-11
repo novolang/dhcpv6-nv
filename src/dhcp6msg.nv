@@ -1,0 +1,933 @@
+// dhcp6msg.nv — the DHCPv6 message of RFC 8415 as bytes in a buffer the
+// caller owns: the client and server header (section 8), the relay
+// header (section 9), the option walk, the DUIDs of section 11 and
+// RFC 6355, and the writers that build a message option by option.
+//
+// Every function is `@tier(embedded)` and `@no_alloc`.  A message is a
+// `Vec[u8; 1024]` held in the caller's frame.  Nothing here allocates,
+// reads a clock or performs input or output.
+//
+// An IPv6 address is an `Ip6`, four 32-bit words held in `Int` fields,
+// most significant first: 2001:db8::1 is `ip6(0x20010DB8, 0, 0, 1)`.
+//
+// A reader that is handed a position outside the message answers a value
+// that cannot be a field (-1 for an option offset, 0 for a number) and
+// never faults, so a message cut anywhere is read without a check from
+// the caller.  An option is named by its offset: the position of its
+// two-byte code.  Its length is at `offset + 2` and its data from
+// `offset + 4`.
+
+// ── Sizes and numbers the format fixes ──────────────────────────────
+
+// The buffer a message is built in and read from.  A relay-forward
+// message adds 34 bytes and an option header to the message it carries,
+// so a client message of up to 986 bytes can be wrapped in one buffer.
+pub const DHCP6_MESSAGE_MAX = 1024
+
+// The UDP port a client listens on, and the port a server and a relay
+// agent listen on (RFC 8415 section 7.2).
+pub const DHCP6_CLIENT_PORT = 546
+// The UDP port a server and a relay agent listen on.
+pub const DHCP6_SERVER_PORT = 547
+
+// The length of the header of a client or server message: one byte of
+// message type and three of transaction identifier (section 8).
+pub const DHCP6_HEADER_LEN = 4
+
+// The length of the header of a relay message: message type, hop count,
+// link address and peer address (section 9).
+pub const DHCP6_RELAY_HEADER_LEN = 34
+
+// The largest hop count a relay agent may put in a Relay-forward
+// message (HOP_COUNT_LIMIT, section 7.6).
+pub const DHCP6_HOP_COUNT_LIMIT = 8
+
+// The largest DUID, in bytes: a two-byte type and up to 128 bytes of
+// identifier (section 11.1).
+pub const DHCP6_DUID_MAX = 130
+
+// A lifetime that never ends: 0xFFFFFFFF seconds (section 7.7).
+pub const DHCP6_INFINITY = 0xFFFFFFFF
+
+// ── Message types (section 7.3) ─────────────────────────────────────
+
+// SOLICIT: a client looks for servers.
+pub const DHCP6_SOLICIT = 1
+// ADVERTISE: a server says it can serve.
+pub const DHCP6_ADVERTISE = 2
+// REQUEST: a client asks a chosen server for addresses and parameters.
+pub const DHCP6_REQUEST = 3
+// CONFIRM: a client asks whether its addresses are still on the link.
+pub const DHCP6_CONFIRM = 4
+// RENEW: a client asks its server to extend its leases.
+pub const DHCP6_RENEW = 5
+// REBIND: a client asks any server to extend its leases.
+pub const DHCP6_REBIND = 6
+// REPLY: a server answers a Request, Confirm, Renew, Rebind, Release,
+// Decline or Information-request.
+pub const DHCP6_REPLY = 7
+// RELEASE: a client gives its leases back.
+pub const DHCP6_RELEASE = 8
+// DECLINE: a client reports that an address is in use by another host.
+pub const DHCP6_DECLINE = 9
+// RECONFIGURE: a server tells a client to renew or ask for information.
+pub const DHCP6_RECONFIGURE = 10
+// INFORMATION-REQUEST: a client asks for parameters and no addresses.
+pub const DHCP6_INFORMATION_REQUEST = 11
+// RELAY-FORW: a relay agent forwards a client message to a server.
+pub const DHCP6_RELAY_FORW = 12
+// RELAY-REPL: a server answers through a relay agent.
+pub const DHCP6_RELAY_REPL = 13
+
+// ── Option codes (RFC 8415 section 21 and the RFCs named) ───────────
+
+// Option 1: the Client Identifier, a DUID.
+pub const DHCP6_OPT_CLIENTID = 1
+// Option 2: the Server Identifier, a DUID.
+pub const DHCP6_OPT_SERVERID = 2
+// Option 3: an Identity Association for Non-temporary Addresses.
+pub const DHCP6_OPT_IA_NA = 3
+// Option 4: an Identity Association for Temporary Addresses.
+pub const DHCP6_OPT_IA_TA = 4
+// Option 5: an address inside an IA_NA or IA_TA.
+pub const DHCP6_OPT_IAADDR = 5
+// Option 6: the Option Request Option, a list of option codes.
+pub const DHCP6_OPT_ORO = 6
+// Option 7: the Preference of a server, one byte.
+pub const DHCP6_OPT_PREFERENCE = 7
+// Option 8: the Elapsed Time of an exchange, in hundredths of a second.
+pub const DHCP6_OPT_ELAPSED_TIME = 8
+// Option 9: the message a relay agent carries.
+pub const DHCP6_OPT_RELAY_MSG = 9
+// Option 11: Authentication.
+pub const DHCP6_OPT_AUTH = 11
+// Option 12: the Server Unicast address.
+pub const DHCP6_OPT_UNICAST = 12
+// Option 13: a Status Code with a message.
+pub const DHCP6_OPT_STATUS_CODE = 13
+// Option 14: Rapid Commit.
+pub const DHCP6_OPT_RAPID_COMMIT = 14
+// Option 15: the User Class.
+pub const DHCP6_OPT_USER_CLASS = 15
+// Option 16: the Vendor Class.
+pub const DHCP6_OPT_VENDOR_CLASS = 16
+// Option 17: Vendor-specific Information.
+pub const DHCP6_OPT_VENDOR_OPTS = 17
+// Option 18: the Interface-Id a relay agent adds.
+pub const DHCP6_OPT_INTERFACE_ID = 18
+// Option 19: the Reconfigure Message, the type of message to follow.
+pub const DHCP6_OPT_RECONF_MSG = 19
+// Option 20: Reconfigure Accept.
+pub const DHCP6_OPT_RECONF_ACCEPT = 20
+// Option 23: the DNS Recursive Name Servers (RFC 3646).
+pub const DHCP6_OPT_DNS_SERVERS = 23
+// Option 24: the Domain Search List (RFC 3646).
+pub const DHCP6_OPT_DOMAIN_LIST = 24
+// Option 25: an Identity Association for Prefix Delegation.
+pub const DHCP6_OPT_IA_PD = 25
+// Option 26: a prefix inside an IA_PD.
+pub const DHCP6_OPT_IAPREFIX = 26
+// Option 32: the Information Refresh Time.
+pub const DHCP6_OPT_INFO_REFRESH_TIME = 32
+// Option 56: the NTP Server option (RFC 5908).
+pub const DHCP6_OPT_NTP_SERVER = 56
+// Option 82: SOL_MAX_RT.
+pub const DHCP6_OPT_SOL_MAX_RT = 82
+// Option 83: INF_MAX_RT.
+pub const DHCP6_OPT_INF_MAX_RT = 83
+
+// ── Status codes (section 21.13) ────────────────────────────────────
+
+// Success.
+pub const DHCP6_STATUS_SUCCESS = 0
+// Failure, reason unspecified.
+pub const DHCP6_STATUS_UNSPEC_FAIL = 1
+// The server has no addresses to assign.
+pub const DHCP6_STATUS_NO_ADDRS_AVAIL = 2
+// The server has no record of the client's binding.
+pub const DHCP6_STATUS_NO_BINDING = 3
+// The prefix of the address does not fit the link.
+pub const DHCP6_STATUS_NOT_ON_LINK = 4
+// The client must send its messages to the multicast address.
+pub const DHCP6_STATUS_USE_MULTICAST = 5
+// The server has no prefixes to delegate.
+pub const DHCP6_STATUS_NO_PREFIX_AVAIL = 6
+
+// ── DUID types (section 11 and RFC 6355) ────────────────────────────
+
+// DUID-LLT: a link-layer address and a time.
+pub const DHCP6_DUID_LLT = 1
+// DUID-EN: an enterprise number and an identifier it assigns.
+pub const DHCP6_DUID_EN = 2
+// DUID-LL: a link-layer address.
+pub const DHCP6_DUID_LL = 3
+// DUID-UUID: a 128-bit universally unique identifier.
+pub const DHCP6_DUID_UUID = 4
+
+// ── Faults ──────────────────────────────────────────────────────────
+
+// A message that can be used.
+pub const DHCP6_FAULT_NONE = 0
+// Fewer bytes than the header of its type needs.
+pub const DHCP6_FAULT_SHORT = 1
+// A message type that is not 1 to 13.
+pub const DHCP6_FAULT_TYPE = 2
+// An option that runs past the end of the area that holds it.
+pub const DHCP6_FAULT_OPTION = 3
+
+// The words for a fault, for a log line.
+pub @tier(embedded)
+@no_alloc
+fn fault_name(fault: Int) -> Str
+    if fault == DHCP6_FAULT_NONE
+        "no fault"
+    elif fault == DHCP6_FAULT_SHORT
+        "the message is shorter than its header"
+    elif fault == DHCP6_FAULT_TYPE
+        "the message type is not 1 to 13"
+    elif fault == DHCP6_FAULT_OPTION
+        "an option runs past the end of its area"
+    else
+        "unknown fault"
+
+// The name of a message type.
+pub @tier(embedded)
+@no_alloc
+fn type_name(t: Int) -> Str
+    if t == DHCP6_SOLICIT
+        "SOLICIT"
+    elif t == DHCP6_ADVERTISE
+        "ADVERTISE"
+    elif t == DHCP6_REQUEST
+        "REQUEST"
+    elif t == DHCP6_CONFIRM
+        "CONFIRM"
+    elif t == DHCP6_RENEW
+        "RENEW"
+    elif t == DHCP6_REBIND
+        "REBIND"
+    elif t == DHCP6_REPLY
+        "REPLY"
+    elif t == DHCP6_RELEASE
+        "RELEASE"
+    elif t == DHCP6_DECLINE
+        "DECLINE"
+    elif t == DHCP6_RECONFIGURE
+        "RECONFIGURE"
+    elif t == DHCP6_INFORMATION_REQUEST
+        "INFORMATION-REQUEST"
+    elif t == DHCP6_RELAY_FORW
+        "RELAY-FORW"
+    elif t == DHCP6_RELAY_REPL
+        "RELAY-REPL"
+    else
+        "unknown message type"
+
+// The name of a status code.
+pub @tier(embedded)
+@no_alloc
+fn status_name(code: Int) -> Str
+    if code == DHCP6_STATUS_SUCCESS
+        "Success"
+    elif code == DHCP6_STATUS_UNSPEC_FAIL
+        "UnspecFail"
+    elif code == DHCP6_STATUS_NO_ADDRS_AVAIL
+        "NoAddrsAvail"
+    elif code == DHCP6_STATUS_NO_BINDING
+        "NoBinding"
+    elif code == DHCP6_STATUS_NOT_ON_LINK
+        "NotOnLink"
+    elif code == DHCP6_STATUS_USE_MULTICAST
+        "UseMulticast"
+    elif code == DHCP6_STATUS_NO_PREFIX_AVAIL
+        "NoPrefixAvail"
+    else
+        "unknown status"
+
+// ── Addresses ───────────────────────────────────────────────────────
+
+// An IPv6 address as four 32-bit words, `a` the most significant.
+pub @value
+struct Ip6
+    a: Int
+    b: Int
+    c: Int
+    d: Int
+
+// An address from its four words.  Each is reduced to its low 32 bits.
+pub @tier(embedded)
+@no_alloc
+fn ip6(a: Int, b: Int, c: Int, d: Int) -> Ip6
+    Ip6 { a: a & 0xFFFFFFFF, b: b & 0xFFFFFFFF, c: c & 0xFFFFFFFF, d: d & 0xFFFFFFFF }
+
+// The unspecified address, ::.
+pub @tier(embedded)
+@no_alloc
+fn ip6_zero() -> Ip6
+    Ip6 { a: 0, b: 0, c: 0, d: 0 }
+
+// Whether two addresses are the same.
+pub @tier(embedded)
+@no_alloc
+fn ip6_eq(x: Ip6, y: Ip6) -> Bool
+    x.a == y.a and x.b == y.b and x.c == y.c and x.d == y.d
+
+// Whether an address is ::.
+pub @tier(embedded)
+@no_alloc
+fn ip6_is_zero(x: Ip6) -> Bool
+    x.a == 0 and x.b == 0 and x.c == 0 and x.d == 0
+
+// The octet of an address that is `n` places from the left, 0 to 15.
+pub @tier(embedded)
+@no_alloc
+fn ip6_octet(x: Ip6, n: Int) -> Int
+    if n < 0 or n > 15
+        0
+    else
+        let w = n / 4
+        var word = x.d
+        if w == 0
+            word = x.a
+        elif w == 1
+            word = x.b
+        elif w == 2
+            word = x.c
+        (word >> (24 - 8 * (n % 4))) & 255
+
+// ff02::1:2, All_DHCP_Relay_Agents_and_Servers: where a client sends
+// its multicast messages (section 7.1).
+pub @tier(embedded)
+@no_alloc
+fn all_relay_agents_and_servers() -> Ip6
+    Ip6 { a: 0xFF020000, b: 0, c: 0, d: 0x00010002 }
+
+// ff05::1:3, All_DHCP_Servers: where a relay agent may send to the
+// servers of a site (section 7.1).
+pub @tier(embedded)
+@no_alloc
+fn all_servers() -> Ip6
+    Ip6 { a: 0xFF050000, b: 0, c: 0, d: 0x00010003 }
+
+// ── Reading ─────────────────────────────────────────────────────────
+
+// The byte at `at`, or 0 when the message does not reach it.
+pub @tier(embedded)
+@no_alloc
+fn u8_at(var m: Vec[u8; 1024], at: Int) -> Int
+    if at < 0 or at >= m.len()
+        0
+    else
+        m[at] as Int
+
+// The 16-bit number at `at`, big-endian.
+pub @tier(embedded)
+@no_alloc
+fn u16_at(var m: Vec[u8; 1024], at: Int) -> Int
+    (u8_at(var m, at) << 8) | u8_at(var m, at + 1)
+
+// The 24-bit number at `at`, big-endian.
+pub @tier(embedded)
+@no_alloc
+fn u24_at(var m: Vec[u8; 1024], at: Int) -> Int
+    (u16_at(var m, at) << 8) | u8_at(var m, at + 2)
+
+// The 32-bit number at `at`, big-endian.
+pub @tier(embedded)
+@no_alloc
+fn u32_at(var m: Vec[u8; 1024], at: Int) -> Int
+    (u16_at(var m, at) << 16) | u16_at(var m, at + 2)
+
+// The address at `at`: sixteen bytes, zero where the message ends.
+pub @tier(embedded)
+@no_alloc
+fn ip6_at(var m: Vec[u8; 1024], at: Int) -> Ip6
+    Ip6 { a: u32_at(var m, at), b: u32_at(var m, at + 4), c: u32_at(var m, at + 8), d: u32_at(var m, at + 12) }
+
+// The message type, the first byte.
+pub @tier(embedded)
+@no_alloc
+fn msg_type(var m: Vec[u8; 1024]) -> Int
+    u8_at(var m, 0)
+
+// The transaction identifier of a client or server message, 24 bits.
+pub @tier(embedded)
+@no_alloc
+fn xid(var m: Vec[u8; 1024]) -> Int
+    u24_at(var m, 1)
+
+// Whether a message is a Relay-forward or Relay-reply.
+pub @tier(embedded)
+@no_alloc
+fn is_relay(var m: Vec[u8; 1024]) -> Bool
+    msg_type(var m) == DHCP6_RELAY_FORW or msg_type(var m) == DHCP6_RELAY_REPL
+
+// The hop count of a relay message (section 9).
+pub @tier(embedded)
+@no_alloc
+fn relay_hop_count(var m: Vec[u8; 1024]) -> Int
+    u8_at(var m, 1)
+
+// The link address of a relay message: an address on the link the
+// client is attached to.
+pub @tier(embedded)
+@no_alloc
+fn relay_link_address(var m: Vec[u8; 1024]) -> Ip6
+    ip6_at(var m, 2)
+
+// The peer address of a relay message: the address of the client or of
+// the previous relay agent.
+pub @tier(embedded)
+@no_alloc
+fn relay_peer_address(var m: Vec[u8; 1024]) -> Ip6
+    ip6_at(var m, 18)
+
+// Where the options of a message start: byte 4, or byte 34 for a relay
+// message.
+pub @tier(embedded)
+@no_alloc
+fn options_start(var m: Vec[u8; 1024]) -> Int
+    if is_relay(var m)
+        DHCP6_RELAY_HEADER_LEN
+    else
+        DHCP6_HEADER_LEN
+
+// Where the options of a message end: the length of the message.
+pub @tier(embedded)
+@no_alloc
+fn options_end(var m: Vec[u8; 1024]) -> Int
+    m.len()
+
+// ── Options ─────────────────────────────────────────────────────────
+
+// The code of the option at offset `at`.
+pub @tier(embedded)
+@no_alloc
+fn opt_code(var m: Vec[u8; 1024], at: Int) -> Int
+    u16_at(var m, at)
+
+// The length of the data of the option at offset `at`.
+pub @tier(embedded)
+@no_alloc
+fn opt_len(var m: Vec[u8; 1024], at: Int) -> Int
+    u16_at(var m, at + 2)
+
+// Where the data of the option at offset `at` starts.
+pub @tier(embedded)
+@no_alloc
+fn opt_data(at: Int) -> Int
+    at + 4
+
+// Where the data of the option at offset `at` ends.
+pub @tier(embedded)
+@no_alloc
+fn opt_end(var m: Vec[u8; 1024], at: Int) -> Int
+    at + 4 + opt_len(var m, at)
+
+// The offset of the `nth` option, counting from 0, whose code is `code`
+// in the options between `lo` and `hi`, or -1.  The walk stops at an
+// option that does not fit.  Pass the start and end of a message's
+// options, or of the options inside an IA, to search either.
+pub @tier(embedded)
+@no_alloc
+fn find_option(var m: Vec[u8; 1024], lo: Int, hi: Int, code: Int, nth: Int) -> Int
+    var end = hi
+    if end > m.len()
+        end = m.len()
+    var pos = lo
+    var seen = 0
+    var found = -1
+    var live = lo >= 0
+    for _ in 0..256
+        if live and pos + 4 <= end
+            let len = u16_at(var m, pos + 2)
+            if pos + 4 + len > end
+                live = false
+            else
+                if u16_at(var m, pos) == code
+                    if seen == nth
+                        found = pos
+                        live = false
+                    seen = seen + 1
+                pos = pos + 4 + len
+        else
+            live = false
+    found
+
+// The first option with `code` in a message's own options, or -1.
+pub @tier(embedded)
+@no_alloc
+fn find(var m: Vec[u8; 1024], code: Int) -> Int
+    find_option(var m, options_start(var m), options_end(var m), code, 0)
+
+// How many options between `lo` and `hi` carry `code`.
+pub @tier(embedded)
+@no_alloc
+fn count_options(var m: Vec[u8; 1024], lo: Int, hi: Int, code: Int) -> Int
+    var n = 0
+    for i in 0..256
+        if find_option(var m, lo, hi, code, i) >= 0
+            n = n + 1
+    n
+
+// Whether the options between `lo` and `hi` are laid end to end with
+// each one inside the area.
+pub @tier(embedded)
+@no_alloc
+fn options_well_formed(var m: Vec[u8; 1024], lo: Int, hi: Int) -> Bool
+    var pos = lo
+    var ok = true
+    var live = true
+    for _ in 0..256
+        if live and pos < hi
+            if pos + 4 > hi
+                ok = false
+                live = false
+            else
+                let len = u16_at(var m, pos + 2)
+                if pos + 4 + len > hi
+                    ok = false
+                    live = false
+                else
+                    pos = pos + 4 + len
+        else
+            live = false
+    ok
+
+// Whether a received message can be used, and if not, why: one of the
+// `DHCP6_FAULT_*` numbers.
+pub @tier(embedded)
+@no_alloc
+fn validate(var m: Vec[u8; 1024]) -> Int
+    let t = msg_type(var m)
+    if m.len() < DHCP6_HEADER_LEN
+        DHCP6_FAULT_SHORT
+    elif t < DHCP6_SOLICIT or t > DHCP6_RELAY_REPL
+        DHCP6_FAULT_TYPE
+    elif is_relay(var m) and m.len() < DHCP6_RELAY_HEADER_LEN
+        DHCP6_FAULT_SHORT
+    elif not options_well_formed(var m, options_start(var m), options_end(var m))
+        DHCP6_FAULT_OPTION
+    else
+        DHCP6_FAULT_NONE
+
+// ── Writing ─────────────────────────────────────────────────────────
+
+// Append one byte.  Answers false when the buffer is full, and then the
+// message built so far is incomplete and must be discarded.
+pub @tier(embedded)
+@no_alloc
+fn put_u8(var m: Vec[u8; 1024], v: Int) -> Bool
+    match m.push((v & 255) as u8)
+        Ok(_)  => true
+        Err(_) => false
+
+// Append a 16-bit number, big-endian.
+pub @tier(embedded)
+@no_alloc
+fn put_u16(var m: Vec[u8; 1024], v: Int) -> Bool
+    put_u8(var m, v >> 8) and put_u8(var m, v)
+
+// Append a 24-bit number, big-endian.
+pub @tier(embedded)
+@no_alloc
+fn put_u24(var m: Vec[u8; 1024], v: Int) -> Bool
+    put_u8(var m, v >> 16) and put_u16(var m, v)
+
+// Append a 32-bit number, big-endian.
+pub @tier(embedded)
+@no_alloc
+fn put_u32(var m: Vec[u8; 1024], v: Int) -> Bool
+    put_u16(var m, v >> 16) and put_u16(var m, v)
+
+// Append an address, sixteen bytes.
+pub @tier(embedded)
+@no_alloc
+fn put_ip6(var m: Vec[u8; 1024], x: Ip6) -> Bool
+    put_u32(var m, x.a) and put_u32(var m, x.b) and put_u32(var m, x.c) and put_u32(var m, x.d)
+
+// Overwrite the 16-bit number at `at`, which the message already holds.
+@tier(embedded)
+@no_alloc
+fn set_u16(var m: Vec[u8; 1024], at: Int, v: Int)
+    if at >= 0 and at + 1 < m.len()
+        m[at] = ((v >> 8) & 255) as u8
+        m[at + 1] = (v & 255) as u8
+
+// Start a client or server message: clear the buffer and write the
+// message type and the transaction identifier.  Answers false only when
+// the buffer cannot hold four bytes.
+pub @tier(embedded)
+@no_alloc
+fn begin(var m: Vec[u8; 1024], kind: Int, txid: Int) -> Bool
+    m.clear()
+    put_u8(var m, kind) and put_u24(var m, txid)
+
+// Start a relay message: clear the buffer and write the message type
+// (`DHCP6_RELAY_FORW` or `DHCP6_RELAY_REPL`), the hop count, the link
+// address and the peer address.
+pub @tier(embedded)
+@no_alloc
+fn begin_relay(var m: Vec[u8; 1024], kind: Int, hops: Int, link: Ip6, peer: Ip6) -> Bool
+    m.clear()
+    put_u8(var m, kind) and put_u8(var m, hops) and put_ip6(var m, link) and put_ip6(var m, peer)
+
+// Start an option: write its code and a length of zero, and answer its
+// offset, or -1 when the buffer is full.  Write the data, then call
+// `close_option` with the offset.  An option may be opened inside
+// another to nest it.
+pub @tier(embedded)
+@no_alloc
+fn open_option(var m: Vec[u8; 1024], code: Int) -> Int
+    let at = m.len()
+    if put_u16(var m, code) and put_u16(var m, 0)
+        at
+    else
+        -1
+
+// Finish the option opened at `at`: write its length, which is the
+// number of bytes appended since.  Answers false when `at` is not an
+// offset `open_option` answered or the data is more than 65535 bytes.
+pub @tier(embedded)
+@no_alloc
+fn close_option(var m: Vec[u8; 1024], at: Int) -> Bool
+    let len = m.len() - at - 4
+    if at < 0 or len < 0 or len > 65535
+        false
+    else
+        set_u16(var m, at + 2, len)
+        true
+
+// An option with no data, such as Rapid Commit or Reconfigure Accept.
+pub @tier(embedded)
+@no_alloc
+fn put_option_empty(var m: Vec[u8; 1024], code: Int) -> Bool
+    put_u16(var m, code) and put_u16(var m, 0)
+
+// An option of one byte.
+pub @tier(embedded)
+@no_alloc
+fn put_option_u8(var m: Vec[u8; 1024], code: Int, v: Int) -> Bool
+    put_u16(var m, code) and put_u16(var m, 1) and put_u8(var m, v)
+
+// An option of two bytes.
+pub @tier(embedded)
+@no_alloc
+fn put_option_u16(var m: Vec[u8; 1024], code: Int, v: Int) -> Bool
+    put_u16(var m, code) and put_u16(var m, 2) and put_u16(var m, v)
+
+// An option of four bytes.
+pub @tier(embedded)
+@no_alloc
+fn put_option_u32(var m: Vec[u8; 1024], code: Int, v: Int) -> Bool
+    put_u16(var m, code) and put_u16(var m, 4) and put_u32(var m, v)
+
+// An option that is one address.
+pub @tier(embedded)
+@no_alloc
+fn put_option_ip6(var m: Vec[u8; 1024], code: Int, x: Ip6) -> Bool
+    put_u16(var m, code) and put_u16(var m, 16) and put_ip6(var m, x)
+
+// An option made of the bytes of a DUID, which is how the Client
+// Identifier and the Server Identifier are written.
+pub @tier(embedded)
+@no_alloc
+fn put_option_duid(var m: Vec[u8; 1024], code: Int, var duid: Vec[u8; 130]) -> Bool
+    var ok = put_u16(var m, code) and put_u16(var m, duid.len())
+    for i in 0..duid.len()
+        ok = ok and put_u8(var m, duid[i] as Int)
+    ok
+
+// An option made of the bytes of `data`, which may be empty.
+pub @tier(embedded)
+@no_alloc
+fn put_option_bytes(var m: Vec[u8; 1024], code: Int, var data: Vec[u8; 128]) -> Bool
+    var ok = put_u16(var m, code) and put_u16(var m, data.len())
+    for i in 0..data.len()
+        ok = ok and put_u8(var m, data[i] as Int)
+    ok
+
+// The Client Identifier option.
+pub @tier(embedded)
+@no_alloc
+fn put_client_id(var m: Vec[u8; 1024], var duid: Vec[u8; 130]) -> Bool
+    put_option_duid(var m, DHCP6_OPT_CLIENTID, var duid)
+
+// The Server Identifier option.
+pub @tier(embedded)
+@no_alloc
+fn put_server_id(var m: Vec[u8; 1024], var duid: Vec[u8; 130]) -> Bool
+    put_option_duid(var m, DHCP6_OPT_SERVERID, var duid)
+
+// The Elapsed Time option: hundredths of a second since the client began
+// the exchange, held to what 16 bits carry.
+pub @tier(embedded)
+@no_alloc
+fn put_elapsed_time(var m: Vec[u8; 1024], centiseconds: Int) -> Bool
+    var cs = centiseconds
+    if cs > 65535
+        cs = 65535
+    if cs < 0
+        cs = 0
+    put_option_u16(var m, DHCP6_OPT_ELAPSED_TIME, cs)
+
+// The Preference option of a server.
+pub @tier(embedded)
+@no_alloc
+fn put_preference(var m: Vec[u8; 1024], preference: Int) -> Bool
+    put_option_u8(var m, DHCP6_OPT_PREFERENCE, preference)
+
+// The Option Request option: the codes of the options the client wants.
+pub @tier(embedded)
+@no_alloc
+fn put_option_request(var m: Vec[u8; 1024], var codes: Vec[u16; 16]) -> Bool
+    var ok = put_u16(var m, DHCP6_OPT_ORO) and put_u16(var m, codes.len() * 2)
+    for i in 0..codes.len()
+        ok = ok and put_u16(var m, codes[i] as Int)
+    ok
+
+// The Status Code option with a status and no message.
+pub @tier(embedded)
+@no_alloc
+fn put_status_code(var m: Vec[u8; 1024], code: Int) -> Bool
+    put_u16(var m, DHCP6_OPT_STATUS_CODE) and put_u16(var m, 2) and put_u16(var m, code)
+
+// The Status Code option with a status and a message of up to 128 bytes
+// of UTF-8 text.
+pub @tier(embedded)
+@no_alloc
+fn put_status_message(var m: Vec[u8; 1024], code: Int, var text: Vec[u8; 128]) -> Bool
+    var ok = put_u16(var m, DHCP6_OPT_STATUS_CODE) and put_u16(var m, 2 + text.len()) and put_u16(var m, code)
+    for i in 0..text.len()
+        ok = ok and put_u8(var m, text[i] as Int)
+    ok
+
+// Start an IA_NA option: its identifier and the times T1 and T2 in
+// seconds.  Answers the offset to pass to `close_option` after the IA
+// Address options and any Status Code have been written, or -1.
+pub @tier(embedded)
+@no_alloc
+fn open_ia_na(var m: Vec[u8; 1024], iaid: Int, t1: Int, t2: Int) -> Int
+    let at = open_option(var m, DHCP6_OPT_IA_NA)
+    if at >= 0 and put_u32(var m, iaid) and put_u32(var m, t1) and put_u32(var m, t2)
+        at
+    else
+        -1
+
+// Start an IA_PD option, which has the same fields as an IA_NA.
+pub @tier(embedded)
+@no_alloc
+fn open_ia_pd(var m: Vec[u8; 1024], iaid: Int, t1: Int, t2: Int) -> Int
+    let at = open_option(var m, DHCP6_OPT_IA_PD)
+    if at >= 0 and put_u32(var m, iaid) and put_u32(var m, t1) and put_u32(var m, t2)
+        at
+    else
+        -1
+
+// Start an IA_TA option: its identifier alone.
+pub @tier(embedded)
+@no_alloc
+fn open_ia_ta(var m: Vec[u8; 1024], iaid: Int) -> Int
+    let at = open_option(var m, DHCP6_OPT_IA_TA)
+    if at >= 0 and put_u32(var m, iaid)
+        at
+    else
+        -1
+
+// An IA Address option with no options of its own: the address and its
+// preferred and valid lifetimes in seconds.
+pub @tier(embedded)
+@no_alloc
+fn put_ia_addr(var m: Vec[u8; 1024], addr: Ip6, preferred: Int, valid: Int) -> Bool
+    put_u16(var m, DHCP6_OPT_IAADDR) and put_u16(var m, 24) and put_ip6(var m, addr)
+        and put_u32(var m, preferred) and put_u32(var m, valid)
+
+// An IA Prefix option with no options of its own: the lifetimes in
+// seconds, the prefix length in bits and the prefix.
+pub @tier(embedded)
+@no_alloc
+fn put_ia_prefix(var m: Vec[u8; 1024], preferred: Int, valid: Int, plen: Int, prefix: Ip6) -> Bool
+    put_u16(var m, DHCP6_OPT_IAPREFIX) and put_u16(var m, 25) and put_u32(var m, preferred)
+        and put_u32(var m, valid) and put_u8(var m, plen) and put_ip6(var m, prefix)
+
+// The Server Unicast option: the address a client may send to.
+pub @tier(embedded)
+@no_alloc
+fn put_server_unicast(var m: Vec[u8; 1024], x: Ip6) -> Bool
+    put_option_ip6(var m, DHCP6_OPT_UNICAST, x)
+
+// The Information Refresh Time option, in seconds.
+pub @tier(embedded)
+@no_alloc
+fn put_info_refresh_time(var m: Vec[u8; 1024], seconds: Int) -> Bool
+    put_option_u32(var m, DHCP6_OPT_INFO_REFRESH_TIME, seconds)
+
+// The SOL_MAX_RT option, in seconds.
+pub @tier(embedded)
+@no_alloc
+fn put_sol_max_rt(var m: Vec[u8; 1024], seconds: Int) -> Bool
+    put_option_u32(var m, DHCP6_OPT_SOL_MAX_RT, seconds)
+
+// The INF_MAX_RT option, in seconds.
+pub @tier(embedded)
+@no_alloc
+fn put_inf_max_rt(var m: Vec[u8; 1024], seconds: Int) -> Bool
+    put_option_u32(var m, DHCP6_OPT_INF_MAX_RT, seconds)
+
+// The Reconfigure Message option: the type of message to follow, which
+// is `DHCP6_RENEW` or `DHCP6_INFORMATION_REQUEST`.
+pub @tier(embedded)
+@no_alloc
+fn put_reconfigure_message(var m: Vec[u8; 1024], kind: Int) -> Bool
+    put_option_u8(var m, DHCP6_OPT_RECONF_MSG, kind)
+
+// The Reconfigure Accept option, which a client puts in a Solicit or a
+// Request to say it takes Reconfigure messages.
+pub @tier(embedded)
+@no_alloc
+fn put_reconfigure_accept(var m: Vec[u8; 1024]) -> Bool
+    put_option_empty(var m, DHCP6_OPT_RECONF_ACCEPT)
+
+// The Rapid Commit option.
+pub @tier(embedded)
+@no_alloc
+fn put_rapid_commit(var m: Vec[u8; 1024]) -> Bool
+    put_option_empty(var m, DHCP6_OPT_RAPID_COMMIT)
+
+// The Interface-Id option a relay agent adds, from up to 128 bytes.
+pub @tier(embedded)
+@no_alloc
+fn put_interface_id(var m: Vec[u8; 1024], var id: Vec[u8; 128]) -> Bool
+    put_option_bytes(var m, DHCP6_OPT_INTERFACE_ID, var id)
+
+// The Relay Message option: the whole of `inner`, a message a relay
+// agent carries, as the data of one option.
+pub @tier(embedded)
+@no_alloc
+fn put_relay_message(var m: Vec[u8; 1024], var inner: Vec[u8; 1024]) -> Bool
+    var ok = put_u16(var m, DHCP6_OPT_RELAY_MSG) and put_u16(var m, inner.len())
+    for i in 0..inner.len()
+        ok = ok and put_u8(var m, inner[i] as Int)
+    ok
+
+// Copy the message a relay message carries into `out`, replacing what
+// it held.  Answers false, and leaves `out` empty, when `m` is not a
+// relay message or carries none.
+pub @tier(embedded)
+@no_alloc
+fn relay_inner(var m: Vec[u8; 1024], var out: Vec[u8; 1024]) -> Bool
+    out.clear()
+    let at = find(var m, DHCP6_OPT_RELAY_MSG)
+    if not is_relay(var m) or at < 0
+        false
+    else
+        let end = opt_end(var m, at)
+        for i in opt_data(at)..end
+            let _p = out.push(m[i])
+        true
+
+// ── DUIDs (section 11, RFC 6355) ────────────────────────────────────
+
+// Append one byte to a DUID.
+@tier(embedded)
+@no_alloc
+fn duid_push8(var d: Vec[u8; 130], v: Int) -> Bool
+    match d.push((v & 255) as u8)
+        Ok(_)  => true
+        Err(_) => false
+
+// Append the bytes of `src` to a DUID.
+@tier(embedded)
+@no_alloc
+fn duid_push_all(var d: Vec[u8; 130], var src: Vec[u8; 128]) -> Bool
+    var ok = true
+    for i in 0..src.len()
+        ok = ok and duid_push8(var d, src[i] as Int)
+    ok
+
+// Append a 16-bit number to a DUID.
+@tier(embedded)
+@no_alloc
+fn duid_push16(var d: Vec[u8; 130], v: Int) -> Bool
+    duid_push8(var d, v >> 8) and duid_push8(var d, v)
+
+// Append a 32-bit number to a DUID.
+@tier(embedded)
+@no_alloc
+fn duid_push32(var d: Vec[u8; 130], v: Int) -> Bool
+    duid_push16(var d, v >> 16) and duid_push16(var d, v)
+
+// A DUID-LL (type 3): the hardware type of the link layer, such as 1 for
+// Ethernet, and the link-layer address in `ll`, replacing what `d` held.
+// Answers false when the DUID would not fit.
+pub @tier(embedded)
+@no_alloc
+fn duid_ll(var d: Vec[u8; 130], hardware_type: Int, var ll: Vec[u8; 128]) -> Bool
+    d.clear()
+    duid_push16(var d, DHCP6_DUID_LL) and duid_push16(var d, hardware_type) and duid_push_all(var d, var ll)
+
+// A DUID-LLT (type 1): as DUID-LL with the time the DUID was made, in
+// seconds since midnight 1 January 2000 UTC, modulo 2^32.
+pub @tier(embedded)
+@no_alloc
+fn duid_llt(var d: Vec[u8; 130], hardware_type: Int, time: Int, var ll: Vec[u8; 128]) -> Bool
+    d.clear()
+    duid_push16(var d, DHCP6_DUID_LLT) and duid_push16(var d, hardware_type) and duid_push32(var d, time)
+        and duid_push_all(var d, var ll)
+
+// A DUID-EN (type 2): an enterprise number from the IANA registry and
+// an identifier that enterprise assigned, in `id`.
+pub @tier(embedded)
+@no_alloc
+fn duid_en(var d: Vec[u8; 130], enterprise: Int, var id: Vec[u8; 128]) -> Bool
+    d.clear()
+    duid_push16(var d, DHCP6_DUID_EN) and duid_push32(var d, enterprise) and duid_push_all(var d, var id)
+
+// A DUID-UUID (type 4, RFC 6355): the 16 bytes of a UUID in `uuid`.
+// Answers false when `uuid` is not 16 bytes.
+pub @tier(embedded)
+@no_alloc
+fn duid_uuid(var d: Vec[u8; 130], var uuid: Vec[u8; 128]) -> Bool
+    d.clear()
+    uuid.len() == 16 and duid_push16(var d, DHCP6_DUID_UUID) and duid_push_all(var d, var uuid)
+
+// The type of the DUID in an option's data starting at `at`, or 0.
+pub @tier(embedded)
+@no_alloc
+fn duid_type_at(var m: Vec[u8; 1024], at: Int) -> Int
+    u16_at(var m, at)
+
+// The type of a DUID held in a buffer, or 0 when it is shorter than two
+// bytes.
+pub @tier(embedded)
+@no_alloc
+fn duid_type(var d: Vec[u8; 130]) -> Int
+    if d.len() < 2
+        0
+    else
+        ((d[0] as Int) << 8) | (d[1] as Int)
+
+// Whether the option at offset `at` holds the bytes of `d`.
+pub @tier(embedded)
+@no_alloc
+fn option_equals_duid(var m: Vec[u8; 1024], at: Int, var d: Vec[u8; 130]) -> Bool
+    var same = at >= 0 and opt_len(var m, at) == d.len() and opt_end(var m, at) <= m.len()
+    for i in 0..d.len()
+        if same and u8_at(var m, opt_data(at) + i) != (d[i] as Int)
+            same = false
+    same
+
+// Copy the data of the option at offset `at` into a DUID buffer,
+// replacing what it held.  Answers false when the option is longer than
+// a DUID can be or `at` is not an option.
+pub @tier(embedded)
+@no_alloc
+fn read_duid(var m: Vec[u8; 1024], at: Int, var d: Vec[u8; 130]) -> Bool
+    d.clear()
+    let len = opt_len(var m, at)
+    if at < 0 or len > DHCP6_DUID_MAX or opt_end(var m, at) > m.len()
+        false
+    else
+        for i in 0..len
+            let _p = d.push(m[opt_data(at) + i])
+        true

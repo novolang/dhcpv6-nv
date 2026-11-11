@@ -1,0 +1,602 @@
+// dhcp6_opt_tests.nv — the options of RFC 8415 and of the RFCs that add
+// to it, read and written as values.
+//
+// The vectors are written out by hand, with the derivation beside the
+// bytes.
+
+use std.test
+use std.bytes
+use std.str
+use dhcp6msg
+use dhcp6opt
+
+// A message from hexadecimal text.
+fn load(hex: Str) -> Vec[u8; 1024]
+    var m: Vec[u8; 1024] = Vec.new()
+    for b in bytes.to_byte_list(bytes.from_hex(hex) ?? bytes.zeros(0))
+        let _p = m.push(b)
+    m
+
+// Whether two messages hold the same bytes.
+fn same(var a: Vec[u8; 1024], var b: Vec[u8; 1024]) -> Bool
+    var eq = a.len() == b.len()
+    for i in 0..a.len()
+        if i < b.len() and a[i] != b[i]
+            eq = false
+    eq
+
+// A REPLY to the SOLICIT of the other suite, with an address and the
+// configuration of RFC 3646, written out by hand.
+//
+//   07 abcdef                        REPLY, transaction 0xabcdef
+//   0001 000a 00030001001122334455   Client Identifier, DUID-LL
+//   0002 000a 00030001aabbccddeeff   Server Identifier, DUID-LL
+//   0003 0028                        IA_NA, 40 = 12 + 4 + 24 bytes
+//     00000001 00000e10 00001c20       IAID 1, T1 3600, T2 7200
+//     0005 0018                        IA Address, 24 bytes
+//       20010db8 00000000 00000000 00000100   2001:db8::100
+//       00001c20 00002a30                     preferred 7200, valid 10800
+//   0017 0020                        DNS servers, 32 bytes
+//     20010db8 00000000 00000000 00000053     2001:db8::53
+//     20010db8 00000000 00000000 00000054     2001:db8::54
+//   0018 000d                        Domain Search List, 13 bytes
+//     07 6578616d706c65 03 636f6d 00          7 "example" 3 "com" 0
+fn reply_hex() -> Str
+    "07abcdef" + "0001000a00030001001122334455" + "0002000a00030001aabbccddeeff" + "00030028" + "00000001" + "00000e10" + "00001c20" + "00050018" + "20010db8000000000000000000000100" + "00001c20" + "00002a30" + "00170020" + "20010db8000000000000000000000053" + "20010db8000000000000000000000054" + "0018000d" + "076578616d706c6503636f6d00"
+
+@test
+fn test_a_reply_with_an_address_and_dns_servers() [io]
+    var m = load(reply_hex())
+    test.assert_eq(m.len(), 4 + 14 + 14 + 44 + 36 + 17)
+    test.assert_eq(dhcp6msg.validate(var m), dhcp6msg.DHCP6_FAULT_NONE)
+    test.assert_eq(dhcp6msg.msg_type(var m), dhcp6msg.DHCP6_REPLY)
+
+    test.case("the IA_NA and the address inside it")
+    let ia = dhcp6opt.find_ia(var m, dhcp6msg.DHCP6_OPT_IA_NA, 1)
+    test.assert_eq(ia, 32)
+    test.assert_eq(dhcp6opt.ia_iaid(var m, ia), 1)
+    test.assert_eq(dhcp6opt.ia_t1(var m, ia), 3600)
+    test.assert_eq(dhcp6opt.ia_t2(var m, ia), 7200)
+    test.assert_eq(dhcp6opt.ia_is_usable(var m, ia), true)
+    test.assert_eq(dhcp6opt.ia_options_start(ia), 48)
+    let a = dhcp6msg.find_option(var m, dhcp6opt.ia_options_start(ia), dhcp6msg.opt_end(var m, ia), dhcp6msg.DHCP6_OPT_IAADDR, 0)
+    test.assert_eq(a, 48)
+    let addr = dhcp6opt.iaaddr_address(var m, a)
+    test.assert_eq(addr.a, 0x20010db8)
+    test.assert_eq(addr.d, 0x100)
+    test.assert_eq(dhcp6opt.iaaddr_preferred(var m, a), 7200)
+    test.assert_eq(dhcp6opt.iaaddr_valid(var m, a), 10800)
+    test.assert_eq(dhcp6opt.iaaddr_is_usable(var m, a), true)
+    test.assert_eq(dhcp6opt.iaaddr_options_start(a), 76)
+    test.assert_eq(dhcp6opt.find_ia(var m, dhcp6msg.DHCP6_OPT_IA_NA, 2), -1)
+    test.assert_eq(dhcp6opt.find_ia(var m, dhcp6msg.DHCP6_OPT_IA_PD, 1), -1)
+
+    test.case("two DNS servers")
+    test.assert_eq(dhcp6opt.dns_server_count(var m), 2)
+    test.assert_eq(dhcp6opt.dns_server(var m, 0).d, 0x53)
+    test.assert_eq(dhcp6opt.dns_server(var m, 1).d, 0x54)
+    test.assert_eq(dhcp6msg.ip6_is_zero(dhcp6opt.dns_server(var m, 2)), true)
+    test.assert_eq(dhcp6msg.ip6_is_zero(dhcp6opt.dns_server(var m, -1)), true)
+
+    test.case("one domain, example.com")
+    let d = dhcp6msg.find(var m, dhcp6msg.DHCP6_OPT_DOMAIN_LIST)
+    test.assert_eq(dhcp6opt.domain_count(var m, d), 1)
+    var text: Vec[u8; 256] = Vec.new()
+    let at = dhcp6opt.domain_nth(var m, d, 0)
+    test.assert_eq(at, dhcp6msg.opt_data(d))
+    test.assert_eq(dhcp6opt.domain_text(var m, at, dhcp6msg.opt_end(var m, d), var text), true)
+    test.assert_eq(text.len(), 11)
+    test.assert_eq(text[0] as Int, 0x65)
+    test.assert_eq(text[7] as Int, 0x2e)
+    test.assert_eq(text[10] as Int, 0x6d)
+    test.assert_eq(dhcp6opt.domain_nth(var m, d, 1), -1)
+    test.assert_eq(dhcp6opt.domain_nth(var m, d, -1), -1)
+
+@test
+fn test_the_writers_build_that_reply_byte_for_byte() [io]
+    var out: Vec[u8; 1024] = Vec.new()
+    var cid: Vec[u8; 130] = Vec.new()
+    var sid: Vec[u8; 130] = Vec.new()
+    var ll: Vec[u8; 128] = Vec.new()
+    for b in [0x00, 0x11, 0x22, 0x33, 0x44, 0x55]
+        let _p = ll.push(b as u8)
+    let _a = dhcp6msg.duid_ll(var cid, 1, var ll)
+    var ll2: Vec[u8; 128] = Vec.new()
+    for b in [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]
+        let _p = ll2.push(b as u8)
+    let _b = dhcp6msg.duid_ll(var sid, 1, var ll2)
+    var ok = dhcp6msg.begin(var out, dhcp6msg.DHCP6_REPLY, 0xabcdef)
+    ok = ok and dhcp6msg.put_client_id(var out, var cid)
+    ok = ok and dhcp6msg.put_server_id(var out, var sid)
+    let ia = dhcp6msg.open_ia_na(var out, 1, 3600, 7200)
+    ok = ok and dhcp6msg.put_ia_addr(var out, dhcp6msg.ip6(0x20010db8, 0, 0, 0x100), 7200, 10800)
+    ok = ok and dhcp6msg.close_option(var out, ia)
+    var servers: Vec[dhcp6msg.Ip6; 8] = Vec.new()
+    let _s1 = servers.push(dhcp6msg.ip6(0x20010db8, 0, 0, 0x53))
+    let _s2 = servers.push(dhcp6msg.ip6(0x20010db8, 0, 0, 0x54))
+    ok = ok and dhcp6opt.put_dns_servers(var out, var servers)
+    let dl = dhcp6msg.open_option(var out, dhcp6msg.DHCP6_OPT_DOMAIN_LIST)
+    var name: Vec[u8; 128] = Vec.new()
+    for c in [0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d]
+        let _p = name.push(c as u8)
+    ok = ok and dhcp6opt.put_domain_name(var out, var name)
+    ok = ok and dhcp6msg.close_option(var out, dl)
+    test.assert_eq(ok, true)
+    var want = load(reply_hex())
+    test.assert_eq(same(var out, var want), true)
+
+@test
+fn test_status_codes_are_read_from_a_message_and_from_inside_an_ia() [io]
+    test.case("absent means Success")
+    var m = load(reply_hex())
+    test.assert_eq(dhcp6opt.message_status(var m), 0)
+
+    test.case("a top-level NoAddrsAvail with a message")
+    var n = load("07000001" + "000d0009" + "0002" + "6e6f2061646472")
+    test.assert_eq(dhcp6opt.message_status(var n), 2)
+    let st = dhcp6msg.find(var n, dhcp6msg.DHCP6_OPT_STATUS_CODE)
+    test.assert_eq(dhcp6opt.status_message_len(var n, st), 7)
+    test.assert_eq(dhcp6opt.status_message_byte(var n, st, 6), 0x72)
+
+    test.case("a status inside an IA_NA is found in the IA's own area")
+    var p = load("07000001" + "0003" + "0012" + "00000001" + "00000000" + "00000000" + "000d0002" + "0003")
+    let ia = dhcp6opt.find_ia(var p, dhcp6msg.DHCP6_OPT_IA_NA, 1)
+    test.assert_eq(dhcp6opt.message_status(var p), 0)
+    test.assert_eq(dhcp6opt.status_code(var p, dhcp6opt.ia_options_start(ia), dhcp6msg.opt_end(var p, ia)), 3)
+
+    test.case("a Status Code option shorter than its code is -1")
+    var q = load("07000001" + "000d0001" + "00")
+    test.assert_eq(dhcp6opt.message_status(var q), -1)
+    test.assert_eq(dhcp6opt.status_message_len(var q, 4), 0)
+    test.assert_eq(dhcp6opt.status_message_byte(var q, 4, 0), -1)
+
+@test
+fn test_t1_and_t2_follow_the_rules_of_section_14_and_21() [io]
+    test.case("the server's value is used when it is not zero")
+    test.assert_eq(dhcp6opt.choose_t1(1000, 7200), 1000)
+    test.assert_eq(dhcp6opt.choose_t2(2000, 7200), 2000)
+    test.case("zero leaves it to the client: 0.5 and 0.8 of the shortest preferred lifetime")
+    test.assert_eq(dhcp6opt.choose_t1(0, 7200), 3600)
+    test.assert_eq(dhcp6opt.choose_t2(0, 7200), 5760)
+    test.case("an infinite lifetime gives an infinite time")
+    test.assert_eq(dhcp6opt.choose_t1(0, dhcp6msg.DHCP6_INFINITY), dhcp6msg.DHCP6_INFINITY)
+    test.assert_eq(dhcp6opt.choose_t2(0, dhcp6msg.DHCP6_INFINITY), dhcp6msg.DHCP6_INFINITY)
+    test.assert_eq(dhcp6opt.choose_t1(500, dhcp6msg.DHCP6_INFINITY), 500)
+
+    test.case("an IA_NA with T1 above T2, both above zero, is discarded")
+    var m = load("07000001" + "0003000c" + "00000001" + "000000c8" + "00000064")
+    let ia = dhcp6msg.find(var m, dhcp6msg.DHCP6_OPT_IA_NA)
+    test.assert_eq(dhcp6opt.ia_t1(var m, ia), 200)
+    test.assert_eq(dhcp6opt.ia_t2(var m, ia), 100)
+    test.assert_eq(dhcp6opt.ia_is_usable(var m, ia), false)
+    test.case("T1 above T2 is fine when one is zero")
+    var n = load("07000001" + "0003000c" + "00000001" + "000000c8" + "00000000")
+    test.assert_eq(dhcp6opt.ia_is_usable(var n, dhcp6msg.find(var n, dhcp6msg.DHCP6_OPT_IA_NA)), true)
+    test.case("an IA_NA shorter than its twelve bytes of fields is not usable")
+    var s = load("07000001" + "0003000b" + "00000001" + "00000000" + "000000")
+    test.assert_eq(dhcp6opt.ia_is_usable(var s, 4), false)
+    test.assert_eq(dhcp6opt.ia_is_usable(var s, -1), false)
+
+@test
+fn test_an_address_whose_preferred_lifetime_exceeds_its_valid_one_is_not_usable() [io]
+    var m: Vec[u8; 1024] = Vec.new()
+    let _b = dhcp6msg.begin(var m, dhcp6msg.DHCP6_REPLY, 1)
+    let _a = dhcp6msg.put_ia_addr(var m, dhcp6msg.ip6(0x20010db8, 0, 0, 1), 200, 100)
+    let _c = dhcp6msg.put_ia_addr(var m, dhcp6msg.ip6(0x20010db8, 0, 0, 2), 100, 100)
+    test.assert_eq(dhcp6opt.iaaddr_is_usable(var m, 4), false)
+    test.assert_eq(dhcp6opt.iaaddr_is_usable(var m, 32), true)
+    test.assert_eq(dhcp6opt.iaaddr_is_usable(var m, -1), false)
+    var short = load("07000001" + "00050010" + "00".repeat(16))
+    test.assert_eq(dhcp6opt.iaaddr_is_usable(var short, 4), false)
+
+@test
+fn test_a_prefix_is_read_and_checked() [io]
+    var m: Vec[u8; 1024] = Vec.new()
+    let _b = dhcp6msg.begin(var m, dhcp6msg.DHCP6_REPLY, 1)
+    let ia = dhcp6msg.open_ia_pd(var m, 5, 100, 200)
+    let _a = dhcp6msg.put_ia_prefix(var m, 300, 400, 56, dhcp6msg.ip6(0x20010db8, 0x1200, 0, 0))
+    let _c = dhcp6msg.put_ia_prefix(var m, 500, 400, 56, dhcp6msg.ip6(0x20010db8, 0x1300, 0, 0))
+    let _d = dhcp6msg.put_ia_prefix(var m, 1, 2, 129, dhcp6msg.ip6(0x20010db8, 0x1400, 0, 0))
+    let _e = dhcp6msg.close_option(var m, ia)
+    test.assert_eq(dhcp6opt.find_ia(var m, dhcp6msg.DHCP6_OPT_IA_PD, 5), ia)
+    test.assert_eq(dhcp6opt.ia_t1(var m, ia), 100)
+    test.assert_eq(dhcp6opt.ia_t2(var m, ia), 200)
+    let start = dhcp6opt.ia_options_start(ia)
+    let end = dhcp6msg.opt_end(var m, ia)
+    let p0 = dhcp6msg.find_option(var m, start, end, dhcp6msg.DHCP6_OPT_IAPREFIX, 0)
+    let p1 = dhcp6msg.find_option(var m, start, end, dhcp6msg.DHCP6_OPT_IAPREFIX, 1)
+    let p2 = dhcp6msg.find_option(var m, start, end, dhcp6msg.DHCP6_OPT_IAPREFIX, 2)
+    test.assert_eq(dhcp6opt.iaprefix_preferred(var m, p0), 300)
+    test.assert_eq(dhcp6opt.iaprefix_valid(var m, p0), 400)
+    test.assert_eq(dhcp6opt.iaprefix_length(var m, p0), 56)
+    test.assert_eq(dhcp6opt.iaprefix_prefix(var m, p0).b, 0x1200)
+    test.assert_eq(dhcp6opt.iaprefix_options_start(p0), p0 + 29)
+    test.assert_eq(dhcp6opt.iaprefix_is_usable(var m, p0), true)
+    test.assert_eq(dhcp6opt.iaprefix_is_usable(var m, p1), false)
+    test.assert_eq(dhcp6opt.iaprefix_is_usable(var m, p2), false)
+    test.assert_eq(dhcp6opt.iaprefix_is_usable(var m, -1), false)
+    var short = load("07000001" + "001a0010" + "00".repeat(16))
+    test.assert_eq(dhcp6opt.iaprefix_is_usable(var short, 4), false)
+
+@test
+fn test_ia_ta_options_start_after_its_identifier() [io]
+    test.assert_eq(dhcp6opt.ia_ta_options_start(10), 18)
+    test.assert_eq(dhcp6opt.ia_options_start(10), 26)
+
+// ── The small options ───────────────────────────────────────────────
+
+@test
+fn test_preference_elapsed_time_and_the_flag_options() [io]
+    var m: Vec[u8; 1024] = Vec.new()
+    let _b = dhcp6msg.begin(var m, dhcp6msg.DHCP6_ADVERTISE, 9)
+    test.assert_eq(dhcp6opt.preference(var m), 0)
+    test.assert_eq(dhcp6opt.elapsed_time(var m), -1)
+    test.assert_eq(dhcp6opt.has_rapid_commit(var m), false)
+    test.assert_eq(dhcp6opt.has_reconfigure_accept(var m), false)
+    test.assert_eq(dhcp6opt.reconfigure_kind(var m), -1)
+    let _p = dhcp6msg.put_preference(var m, 77)
+    let _e = dhcp6msg.put_elapsed_time(var m, 1234)
+    let _r = dhcp6msg.put_rapid_commit(var m)
+    let _a = dhcp6msg.put_reconfigure_accept(var m)
+    let _k = dhcp6msg.put_reconfigure_message(var m, dhcp6msg.DHCP6_INFORMATION_REQUEST)
+    test.assert_eq(dhcp6opt.preference(var m), 77)
+    test.assert_eq(dhcp6opt.elapsed_time(var m), 1234)
+    test.assert_eq(dhcp6opt.has_rapid_commit(var m), true)
+    test.assert_eq(dhcp6opt.has_reconfigure_accept(var m), true)
+    test.assert_eq(dhcp6opt.reconfigure_kind(var m), 11)
+
+    test.case("a Preference or an Elapsed Time of the wrong length is not read")
+    var w = load("02000001" + "00070002" + "0102" + "00080001" + "01" + "00130002" + "0102")
+    test.assert_eq(dhcp6opt.preference(var w), 0)
+    test.assert_eq(dhcp6opt.elapsed_time(var w), -1)
+    test.assert_eq(dhcp6opt.reconfigure_kind(var w), -1)
+
+@test
+fn test_server_unicast() [io]
+    var m: Vec[u8; 1024] = Vec.new()
+    let _b = dhcp6msg.begin(var m, dhcp6msg.DHCP6_ADVERTISE, 9)
+    test.assert_eq(dhcp6opt.has_server_unicast(var m), false)
+    test.assert_eq(dhcp6msg.ip6_is_zero(dhcp6opt.server_unicast(var m)), true)
+    let _u = dhcp6msg.put_server_unicast(var m, dhcp6msg.ip6(0x20010db8, 0, 0, 0x11))
+    test.assert_eq(dhcp6opt.has_server_unicast(var m), true)
+    test.assert_eq(dhcp6opt.server_unicast(var m).d, 0x11)
+    var w = load("02000001" + "000c0004" + "01020304")
+    test.assert_eq(dhcp6opt.has_server_unicast(var w), false)
+    test.assert_eq(dhcp6msg.ip6_is_zero(dhcp6opt.server_unicast(var w)), true)
+
+@test
+fn test_timer_options_and_their_limits() [io]
+    var m: Vec[u8; 1024] = Vec.new()
+    let _b = dhcp6msg.begin(var m, dhcp6msg.DHCP6_REPLY, 9)
+    test.case("absent: the Information Refresh Time is the default and the rest are -1")
+    test.assert_eq(dhcp6opt.info_refresh_time(var m), 86400)
+    test.assert_eq(dhcp6opt.sol_max_rt(var m), -1)
+    test.assert_eq(dhcp6opt.inf_max_rt(var m), -1)
+    test.assert_eq(dhcp6opt.option_u32(var m, 32), -1)
+
+    test.case("present and in range")
+    let _a = dhcp6msg.put_info_refresh_time(var m, 7200)
+    let _s = dhcp6msg.put_sol_max_rt(var m, 120)
+    let _i = dhcp6msg.put_inf_max_rt(var m, 130)
+    test.assert_eq(dhcp6opt.info_refresh_time(var m), 7200)
+    test.assert_eq(dhcp6opt.sol_max_rt(var m), 120)
+    test.assert_eq(dhcp6opt.inf_max_rt(var m), 130)
+
+    test.case("the Information Refresh Time is held at 600 seconds and infinity stays")
+    var low: Vec[u8; 1024] = Vec.new()
+    let _b2 = dhcp6msg.begin(var low, dhcp6msg.DHCP6_REPLY, 9)
+    let _l = dhcp6msg.put_info_refresh_time(var low, 5)
+    test.assert_eq(dhcp6opt.info_refresh_time(var low), 600)
+    var inf: Vec[u8; 1024] = Vec.new()
+    let _b3 = dhcp6msg.begin(var inf, dhcp6msg.DHCP6_REPLY, 9)
+    let _n = dhcp6msg.put_info_refresh_time(var inf, dhcp6msg.DHCP6_INFINITY)
+    test.assert_eq(dhcp6opt.info_refresh_time(var inf), dhcp6msg.DHCP6_INFINITY)
+
+    test.case("SOL_MAX_RT and INF_MAX_RT outside 60 to 86400 are ignored")
+    var out: Vec[u8; 1024] = Vec.new()
+    let _b4 = dhcp6msg.begin(var out, dhcp6msg.DHCP6_REPLY, 9)
+    let _x = dhcp6msg.put_sol_max_rt(var out, 59)
+    let _y = dhcp6msg.put_inf_max_rt(var out, 86401)
+    test.assert_eq(dhcp6opt.sol_max_rt(var out), -1)
+    test.assert_eq(dhcp6opt.inf_max_rt(var out), -1)
+    var edge: Vec[u8; 1024] = Vec.new()
+    let _b5 = dhcp6msg.begin(var edge, dhcp6msg.DHCP6_REPLY, 9)
+    let _x2 = dhcp6msg.put_sol_max_rt(var edge, 60)
+    let _y2 = dhcp6msg.put_inf_max_rt(var edge, 86400)
+    test.assert_eq(dhcp6opt.sol_max_rt(var edge), 60)
+    test.assert_eq(dhcp6opt.inf_max_rt(var edge), 86400)
+    test.case("an option of the wrong length is not a number")
+    var odd = load("07000001" + "00520002" + "0102")
+    test.assert_eq(dhcp6opt.sol_max_rt(var odd), -1)
+
+@test
+fn test_option_request_reading() [io]
+    var m: Vec[u8; 1024] = Vec.new()
+    let _b = dhcp6msg.begin(var m, dhcp6msg.DHCP6_SOLICIT, 9)
+    test.assert_eq(dhcp6opt.oro_count(var m), 0)
+    test.assert_eq(dhcp6opt.oro_code(var m, 0), -1)
+    test.assert_eq(dhcp6opt.oro_contains(var m, 23), false)
+    var codes: Vec[u16; 16] = Vec.new()
+    for c in [23, 24, 56, 82]
+        let _p = codes.push(c as u16)
+    let _o = dhcp6msg.put_option_request(var m, var codes)
+    test.assert_eq(dhcp6opt.oro_count(var m), 4)
+    test.assert_eq(dhcp6opt.oro_code(var m, 2), 56)
+    test.assert_eq(dhcp6opt.oro_code(var m, 4), -1)
+    test.assert_eq(dhcp6opt.oro_code(var m, -1), -1)
+    test.assert_eq(dhcp6opt.oro_contains(var m, 82), true)
+    test.assert_eq(dhcp6opt.oro_contains(var m, 25), false)
+
+@test
+fn test_dns_servers_of_the_wrong_length_are_not_read() [io]
+    var m = load("07000001" + "00170011" + "00".repeat(17))
+    test.assert_eq(dhcp6opt.dns_server_count(var m), 0)
+    var none: Vec[u8; 1024] = Vec.new()
+    let _b = dhcp6msg.begin(var none, dhcp6msg.DHCP6_REPLY, 9)
+    test.assert_eq(dhcp6opt.dns_server_count(var none), 0)
+
+// ── Domain names ────────────────────────────────────────────────────
+
+fn text_of(var m: Vec[u8; 1024], at: Int, hi: Int) -> Str
+    var out: Vec[u8; 256] = Vec.new()
+    if dhcp6opt.domain_text(var m, at, hi, var out)
+        var s = ""
+        for i in 0..out.len()
+            s = s + str_of_byte(out[i] as Int)
+        s
+    else
+        "(bad)"
+
+fn str_of_byte(b: Int) -> Str
+    str.from_byte(b)
+
+@test
+fn test_a_search_list_of_three_names() [io]
+    // example.com, a.b.org, and the root.
+    //   07 example 03 com 00        13 bytes
+    //   01 a 01 b 03 org 00         9 bytes
+    //   00                          1 byte
+    var m = load("07000001" + "0018" + "0017" + "076578616d706c6503636f6d00" + "01610162036f726700" + "00")
+    let o = dhcp6msg.find(var m, dhcp6msg.DHCP6_OPT_DOMAIN_LIST)
+    let hi = dhcp6msg.opt_end(var m, o)
+    test.assert_eq(dhcp6opt.domain_count(var m, o), 3)
+    test.assert_eq(text_of(var m, dhcp6opt.domain_nth(var m, o, 0), hi), "example.com")
+    test.assert_eq(text_of(var m, dhcp6opt.domain_nth(var m, o, 1), hi), "a.b.org")
+    test.assert_eq(text_of(var m, dhcp6opt.domain_nth(var m, o, 2), hi), ".")
+    test.assert_eq(dhcp6opt.domain_nth(var m, o, 3), -1)
+    test.assert_eq(dhcp6opt.domain_next(var m, dhcp6opt.domain_nth(var m, o, 0), hi), dhcp6opt.domain_nth(var m, o, 1))
+
+@test
+fn test_a_malformed_name_stops_the_list() [io]
+    test.case("a label longer than the option")
+    var a = load("07000001" + "00180005" + "0a61626300")
+    test.assert_eq(dhcp6opt.domain_count(var a, 4), 0)
+    test.case("a compression pointer, which this option does not allow")
+    var b = load("07000001" + "00180003" + "c00c00")
+    test.assert_eq(dhcp6opt.domain_count(var b, 4), 0)
+    test.assert_eq(dhcp6opt.domain_next(var b, 8, 11), -1)
+    test.case("a label of 64 bytes")
+    var c = load("07000001" + "00180042" + "40" + "61".repeat(64) + "00")
+    test.assert_eq(dhcp6opt.domain_count(var c, 4), 0)
+    test.case("a name with no terminating zero")
+    var d = load("07000001" + "00180004" + "03616263")
+    test.assert_eq(dhcp6opt.domain_count(var d, 4), 0)
+    var out: Vec[u8; 256] = Vec.new()
+    test.assert_eq(dhcp6opt.domain_text(var d, 8, 12, var out), false)
+    test.case("a good name then a bad one: the good one is counted")
+    var e = load("07000001" + "00180006" + "016100" + "01620a")
+    test.assert_eq(dhcp6opt.domain_count(var e, 4), 1)
+    test.case("an offset that is not an option")
+    test.assert_eq(dhcp6opt.domain_nth(var e, -1, 0), -1)
+    test.assert_eq(dhcp6opt.domain_next(var e, -1, 5), -1)
+    test.assert_eq(dhcp6opt.domain_next(var e, 100, 5), -1)
+
+@test
+fn test_names_are_written_in_label_form() [io]
+    test.case("with and without the closing dot")
+    var m: Vec[u8; 1024] = Vec.new()
+    var t1: Vec[u8; 128] = Vec.new()
+    for c in [0x61, 0x2e, 0x62]
+        let _p = t1.push(c as u8)
+    test.assert_eq(dhcp6opt.put_domain_name(var m, var t1), true)
+    let _d = t1.push(0x2e as u8)
+    test.assert_eq(dhcp6opt.put_domain_name(var m, var t1), true)
+    test.assert_eq(m.len(), 10)
+    test.assert_eq(m[0] as Int, 1)
+    test.assert_eq(m[1] as Int, 0x61)
+    test.assert_eq(m[2] as Int, 1)
+    test.assert_eq(m[4] as Int, 0)
+    test.assert_eq(m[5] as Int, 1)
+    test.assert_eq(m[9] as Int, 0)
+
+    test.case("the root is one dot and writes one zero byte")
+    var r: Vec[u8; 1024] = Vec.new()
+    var root: Vec[u8; 128] = Vec.new()
+    let _q = root.push(0x2e as u8)
+    test.assert_eq(dhcp6opt.put_domain_name(var r, var root), true)
+    test.assert_eq(r.len(), 1)
+    test.assert_eq(r[0] as Int, 0)
+
+    test.case("an empty name, an empty label and a leading dot are refused")
+    var e: Vec[u8; 1024] = Vec.new()
+    var empty: Vec[u8; 128] = Vec.new()
+    test.assert_eq(dhcp6opt.put_domain_name(var e, var empty), false)
+    var bad: Vec[u8; 128] = Vec.new()
+    for c in [0x61, 0x2e, 0x2e, 0x62]
+        let _p = bad.push(c as u8)
+    var e2: Vec[u8; 1024] = Vec.new()
+    test.assert_eq(dhcp6opt.put_domain_name(var e2, var bad), false)
+    var lead: Vec[u8; 128] = Vec.new()
+    for c in [0x2e, 0x61]
+        let _p = lead.push(c as u8)
+    var e3: Vec[u8; 1024] = Vec.new()
+    test.assert_eq(dhcp6opt.put_domain_name(var e3, var lead), false)
+
+    test.case("a label of 63 bytes is fine and one of 64 is not")
+    var l63: Vec[u8; 128] = Vec.new()
+    for _ in 0..63
+        let _p = l63.push(0x61 as u8)
+    var e4: Vec[u8; 1024] = Vec.new()
+    test.assert_eq(dhcp6opt.put_domain_name(var e4, var l63), true)
+    test.assert_eq(e4.len(), 65)
+    let _x = l63.push(0x61 as u8)
+    var e5: Vec[u8; 1024] = Vec.new()
+    test.assert_eq(dhcp6opt.put_domain_name(var e5, var l63), false)
+
+    test.case("the longest text, 127 bytes of one-byte labels, is 129 bytes in label form")
+    var long: Vec[u8; 128] = Vec.new()
+    for i in 0..127
+        if i % 2 == 0
+            let _p = long.push(0x61 as u8)
+        else
+            let _q = long.push(0x2e as u8)
+    var e6: Vec[u8; 1024] = Vec.new()
+    test.assert_eq(dhcp6opt.put_domain_name(var e6, var long), true)
+    test.assert_eq(e6.len(), 129)
+
+    test.case("a full buffer")
+    var full: Vec[u8; 1024] = Vec.new()
+    for _ in 0..1023
+        let _p = full.push(0 as u8)
+    var t2: Vec[u8; 128] = Vec.new()
+    for c in [0x61, 0x62]
+        let _p = t2.push(c as u8)
+    test.assert_eq(dhcp6opt.put_domain_name(var full, var t2), false)
+
+// ── NTP servers ─────────────────────────────────────────────────────
+
+@test
+fn test_an_ntp_server_option_with_its_three_sub_options() [io]
+    //   0038 LLLL                       NTP Server option, code 56
+    //     0001 0010 <addr>                 server address 2001:db8::123
+    //     0002 0010 <addr>                 multicast address ff05::101
+    //     0003 000d 076578616d706c6503636f6d00    FQDN example.com
+    var m: Vec[u8; 1024] = Vec.new()
+    let _b = dhcp6msg.begin(var m, dhcp6msg.DHCP6_REPLY, 3)
+    let o = dhcp6opt.open_ntp_server(var m)
+    test.assert_eq(dhcp6opt.put_ntp_server_address(var m, dhcp6msg.ip6(0x20010db8, 0, 0, 0x123)), true)
+    test.assert_eq(dhcp6opt.put_ntp_multicast_address(var m, dhcp6msg.ip6(0xff050000, 0, 0, 0x101)), true)
+    let f = dhcp6msg.open_option(var m, dhcp6opt.DHCP6_NTP_SRV_FQDN)
+    var name: Vec[u8; 128] = Vec.new()
+    for c in [0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d]
+        let _p = name.push(c as u8)
+    test.assert_eq(dhcp6opt.put_domain_name(var m, var name), true)
+    test.assert_eq(dhcp6msg.close_option(var m, f), true)
+    test.assert_eq(dhcp6msg.close_option(var m, o), true)
+    test.assert_eq(dhcp6msg.opt_len(var m, o), 20 + 20 + 17)
+    let want = load("07000003" + "00380039" + "00010010" + "20010db8000000000000000000000123" + "00020010" + "ff050000000000000000000000000101" + "0003000d" + "076578616d706c6503636f6d00")
+    var w = want
+    test.assert_eq(same(var m, var w), true)
+
+    test.case("each sub-option is found by its code")
+    let s = dhcp6opt.ntp_suboption(var m, o, dhcp6opt.DHCP6_NTP_SRV_ADDR, 0)
+    let mc = dhcp6opt.ntp_suboption(var m, o, dhcp6opt.DHCP6_NTP_MC_ADDR, 0)
+    let fq = dhcp6opt.ntp_suboption(var m, o, dhcp6opt.DHCP6_NTP_SRV_FQDN, 0)
+    test.assert_eq(s, 8)
+    test.assert_eq(mc, 28)
+    test.assert_eq(fq, 48)
+    test.assert_eq(dhcp6opt.ntp_address(var m, s).d, 0x123)
+    test.assert_eq(dhcp6opt.ntp_address(var m, mc).a, 0xff050000)
+    test.assert_eq(dhcp6msg.ip6_is_zero(dhcp6opt.ntp_address(var m, fq)), true)
+    test.assert_eq(dhcp6msg.ip6_is_zero(dhcp6opt.ntp_address(var m, -1)), true)
+    test.assert_eq(dhcp6opt.ntp_suboption(var m, o, dhcp6opt.DHCP6_NTP_SRV_ADDR, 1), -1)
+    test.assert_eq(dhcp6opt.ntp_suboption(var m, -1, 1, 0), -1)
+    test.assert_eq(text_of(var m, dhcp6msg.opt_data(fq), dhcp6msg.opt_end(var m, fq)), "example.com")
+
+// ── Classes and vendor options ──────────────────────────────────────
+
+@test
+fn test_user_class_and_vendor_class_items() [io]
+    //   000f 000d                      User Class, 13 bytes
+    //     0004 61626364                  "abcd"
+    //     0003 656667                    "efg"
+    //     0002 6869                      "hi"
+    //   0010 0010                      Vendor Class, 16 bytes
+    //     00000009                       enterprise 9
+    //     0003 616263                    "abc"
+    //     0003 646566                    "def"
+    var m = load("01000001" + "000f000f" + "0004" + "61626364" + "0003" + "656667" + "0002" + "6869" + "0010000e" + "00000009" + "0003616263" + "0003646566")
+    let u = dhcp6msg.find(var m, dhcp6msg.DHCP6_OPT_USER_CLASS)
+    test.assert_eq(u, 4)
+    let i0 = dhcp6opt.user_class_item(var m, u, 0)
+    let i1 = dhcp6opt.user_class_item(var m, u, 1)
+    let i2 = dhcp6opt.user_class_item(var m, u, 2)
+    test.assert_eq(i0, 8)
+    test.assert_eq(dhcp6opt.class_item_len(var m, i0), 4)
+    test.assert_eq(i1, 14)
+    test.assert_eq(dhcp6opt.class_item_len(var m, i1), 3)
+    test.assert_eq(i2, 19)
+    test.assert_eq(dhcp6msg.u8_at(var m, i2 + 2), 0x68)
+    test.assert_eq(dhcp6opt.user_class_item(var m, u, 3), -1)
+    test.assert_eq(dhcp6opt.user_class_item(var m, u, -1), -1)
+
+    let v = dhcp6msg.find(var m, dhcp6msg.DHCP6_OPT_VENDOR_CLASS)
+    test.assert_eq(dhcp6opt.vendor_enterprise(var m, v), 9)
+    let v0 = dhcp6opt.vendor_class_item(var m, v, 0)
+    let v1 = dhcp6opt.vendor_class_item(var m, v, 1)
+    test.assert_eq(dhcp6opt.class_item_len(var m, v0), 3)
+    test.assert_eq(dhcp6msg.u8_at(var m, v1 + 2), 0x64)
+    test.assert_eq(dhcp6opt.vendor_class_item(var m, v, 2), -1)
+
+    test.case("an item that runs past its option ends the list")
+    var bad = load("01000001" + "000f0006" + "0009" + "616263" + "00")
+    test.assert_eq(dhcp6opt.user_class_item(var bad, 4, 0), -1)
+
+@test
+fn test_vendor_specific_information_sub_options() [io]
+    //   0011 0014                      Vendor-specific Information, 20 bytes
+    //     0000 0009                      enterprise 9
+    //     0001 0002 aabb                 sub-option 1
+    //     0002 0004 01020304             sub-option 2
+    var m = load("01000001" + "00110012" + "00000009" + "00010002aabb" + "0002000401020304")
+    let v = dhcp6msg.find(var m, dhcp6msg.DHCP6_OPT_VENDOR_OPTS)
+    test.assert_eq(dhcp6opt.vendor_enterprise(var m, v), 9)
+    let s2 = dhcp6opt.vendor_suboption(var m, v, 2, 0)
+    test.assert_eq(s2, 18)
+    test.assert_eq(dhcp6msg.opt_len(var m, s2), 4)
+    test.assert_eq(dhcp6msg.u32_at(var m, dhcp6msg.opt_data(s2)), 0x01020304)
+    test.assert_eq(dhcp6opt.vendor_suboption(var m, v, 3, 0), -1)
+    test.assert_eq(dhcp6opt.vendor_suboption(var m, -1, 1, 0), -1)
+
+// ── Authentication ──────────────────────────────────────────────────
+
+@test
+fn test_the_authentication_option_is_read_and_not_verified() [io]
+    //   000b 0017                      Authentication, 23 bytes
+    //     02                             protocol 2: delayed authentication
+    //     01                             algorithm 1: HMAC-MD5
+    //     00                             replay detection method 0: monotonic counter
+    //     0000000100000002               replay detection 0x0000000100000002
+    //     00112233445566778899aabbcc     12 bytes of authentication information
+    var m = load("0b000001" + "000b0017" + "02" + "01" + "00" + "0000000100000002" + "00112233445566778899aabb")
+    let o = dhcp6msg.find(var m, dhcp6msg.DHCP6_OPT_AUTH)
+    test.assert_eq(o, 4)
+    test.assert_eq(dhcp6opt.auth_protocol(var m, o), dhcp6opt.DHCP6_AUTH_DELAYED)
+    test.assert_eq(dhcp6opt.auth_algorithm(var m, o), 1)
+    test.assert_eq(dhcp6opt.auth_rdm(var m, o), 0)
+    test.assert_eq(dhcp6opt.auth_replay_high(var m, o), 1)
+    test.assert_eq(dhcp6opt.auth_replay_low(var m, o), 2)
+    test.assert_eq(dhcp6opt.auth_info_len(var m, o), 12)
+    test.assert_eq(dhcp6opt.auth_info_start(o), 19)
+    test.assert_eq(dhcp6msg.u8_at(var m, dhcp6opt.auth_info_start(o)), 0x00)
+    test.assert_eq(dhcp6opt.DHCP6_AUTH_RECONFIGURE_KEY, 3)
+
+    test.case("an option shorter than its fixed part has no information")
+    var s = load("0b000001" + "000b0003" + "020100")
+    test.assert_eq(dhcp6opt.auth_info_len(var s, 4), 0)
+
+// ── Reconfigure ─────────────────────────────────────────────────────
+
+@test
+fn test_a_reconfigure_message_names_what_the_client_should_send() [io]
+    //   0a 000001                      RECONFIGURE
+    //   0001 000a ...                  Client Identifier
+    //   0002 000a ...                  Server Identifier
+    //   0013 0001 05                   Reconfigure Message: Renew
+    //   000b 0011 ...                  Authentication (not verified here)
+    var m = load("0a000001" + "0001000a00030001001122334455" + "0002000a00030001aabbccddeeff" + "00130001" + "05" + "000b000f" + "03" + "01" + "00" + "0000000000000001" + "00112233")
+    test.assert_eq(dhcp6msg.validate(var m), dhcp6msg.DHCP6_FAULT_NONE)
+    test.assert_eq(dhcp6msg.msg_type(var m), dhcp6msg.DHCP6_RECONFIGURE)
+    test.assert_eq(dhcp6opt.reconfigure_kind(var m), dhcp6msg.DHCP6_RENEW)
+    let a = dhcp6msg.find(var m, dhcp6msg.DHCP6_OPT_AUTH)
+    test.assert_eq(dhcp6opt.auth_protocol(var m, a), dhcp6opt.DHCP6_AUTH_RECONFIGURE_KEY)

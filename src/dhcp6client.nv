@@ -1,0 +1,1209 @@
+// dhcp6client.nv — the client of RFC 8415 section 18.2 as a value the
+// caller steps: Solicit, Advertise selection by preference, Request,
+// Reply, Renew at T1, Rebind at T2, Release, Decline, Confirm, the
+// Information-request of the stateless client and Rapid Commit, with the
+// retransmission schedule of section 15.
+//
+// The client performs nothing.  Time is a number of milliseconds the
+// caller reads from its own clock and passes to every call.  The random
+// word that section 15 asks for is passed in too: its low 24 bits become
+// the transaction identifier of a new exchange and bits 8 to 23 give the
+// randomisation factor of the retransmission timeout.  A datagram that
+// arrives is a `Vec[u8; 1024]` handed to `client_receive`, and a datagram
+// to send is built in a `Vec[u8; 1024]` the caller gives, with the return
+// value saying where to send it.
+//
+// Every function is `@tier(embedded)` and `@no_alloc`.
+//
+// The caller's loop is two calls:
+//
+//   action = client_tick(c, now, random, out)   // when `client_next_at` passes
+//   action = client_receive(c, now, in, out)    // when a datagram arrives
+//
+// and the action says what to do next.  A client holds one IA_NA, which
+// is one address, and one IA_PD, which is one prefix.  The messages it
+// builds and the readers it uses accept any number of either; the client
+// uses the first usable address and prefix a server sends.
+
+use dhcp6msg
+use dhcp6opt
+
+// ── States (section 18) ─────────────────────────────────────────────
+
+// No exchange in progress and no lease.  The next tick schedules the
+// first message after the random delay section 18.2.1 asks for.
+pub const DHCP6_STATE_INIT = 0
+// Waiting out the random delay before the first Solicit,
+// Information-request or Confirm.
+pub const DHCP6_STATE_STARTING = 1
+// A Solicit is out; the client collects Advertise messages.
+pub const DHCP6_STATE_SOLICIT = 2
+// A Request to the chosen server is out.
+pub const DHCP6_STATE_REQUEST = 3
+// The client holds a lease and waits for T1.
+pub const DHCP6_STATE_BOUND = 4
+// T1 has passed; the client asks its server to extend the lease.
+pub const DHCP6_STATE_RENEW = 5
+// T2 has passed; the client asks any server to extend the lease.
+pub const DHCP6_STATE_REBIND = 6
+// A Confirm is out.
+pub const DHCP6_STATE_CONFIRM = 7
+// A Release is out.
+pub const DHCP6_STATE_RELEASE = 8
+// A Decline is out.
+pub const DHCP6_STATE_DECLINE = 9
+// An Information-request is out.
+pub const DHCP6_STATE_INFORM = 10
+// The stateless client holds its parameters and waits for the
+// Information Refresh Time.
+pub const DHCP6_STATE_INFORMED = 11
+// The client gave its lease up and does nothing until `client_restart`.
+pub const DHCP6_STATE_IDLE = 12
+
+// ── Actions ─────────────────────────────────────────────────────────
+
+// Nothing to do.
+pub const DHCP6_ACT_NONE = 0
+// Write the message built in `out` to ff02::1:2 port 547.
+pub const DHCP6_ACT_SEND = 1
+// Write the message built in `out` to the address `client_server_address`
+// answers, port 547, which the server gave in a Server Unicast option.
+pub const DHCP6_ACT_SEND_UNICAST = 2
+// A lease was granted or extended.  Nothing is written.  The address,
+// the prefix and the other parameters are in the client.
+pub const DHCP6_ACT_BOUND = 3
+// The stateless client received its parameters.
+pub const DHCP6_ACT_INFORMED = 4
+// The lease ended with no server having extended it.  The addresses
+// must not be used.  The client is back in INIT.
+pub const DHCP6_ACT_EXPIRED = 5
+// The server refused the client's bindings, or the client's addresses
+// are not on this link.  The addresses must not be used.  The client is
+// back in INIT.
+pub const DHCP6_ACT_REJECTED = 6
+// A Release or Decline ended, by a Reply or by the last attempt.  The
+// client is IDLE.
+pub const DHCP6_ACT_RELEASED = 7
+// An exchange used all its attempts with no answer.  The client is back
+// in INIT.
+pub const DHCP6_ACT_FAILED = 8
+// A Confirm was answered with Success: the addresses are on this link.
+pub const DHCP6_ACT_CONFIRMED = 9
+
+// ── Configuration flags ─────────────────────────────────────────────
+
+// Ask for a non-temporary address.
+pub const DHCP6_WANT_NA = 1
+// Ask for a delegated prefix.
+pub const DHCP6_WANT_PD = 2
+// Ask for the two-message exchange of section 5.1 by putting Rapid
+// Commit in the Solicit.
+pub const DHCP6_RAPID_COMMIT = 4
+// Ask for parameters only, with Information-request (section 6.1).
+pub const DHCP6_STATELESS = 8
+
+// ── Retransmission parameters (section 7.6), in milliseconds ────────
+
+// SOL_MAX_DELAY.
+pub const DHCP6_SOL_MAX_DELAY = 1000
+// SOL_TIMEOUT.
+pub const DHCP6_SOL_TIMEOUT = 1000
+// SOL_MAX_RT.
+pub const DHCP6_SOL_MAX_RT = 3600000
+// REQ_TIMEOUT.
+pub const DHCP6_REQ_TIMEOUT = 1000
+// REQ_MAX_RT.
+pub const DHCP6_REQ_MAX_RT = 30000
+// REQ_MAX_RC.
+pub const DHCP6_REQ_MAX_RC = 10
+// CNF_MAX_DELAY.
+pub const DHCP6_CNF_MAX_DELAY = 1000
+// CNF_TIMEOUT.
+pub const DHCP6_CNF_TIMEOUT = 1000
+// CNF_MAX_RT.
+pub const DHCP6_CNF_MAX_RT = 4000
+// CNF_MAX_RD.
+pub const DHCP6_CNF_MAX_RD = 10000
+// REN_TIMEOUT.
+pub const DHCP6_REN_TIMEOUT = 10000
+// REN_MAX_RT.
+pub const DHCP6_REN_MAX_RT = 600000
+// REB_TIMEOUT.
+pub const DHCP6_REB_TIMEOUT = 10000
+// REB_MAX_RT.
+pub const DHCP6_REB_MAX_RT = 600000
+// INF_MAX_DELAY.
+pub const DHCP6_INF_MAX_DELAY = 1000
+// INF_TIMEOUT.
+pub const DHCP6_INF_TIMEOUT = 1000
+// INF_MAX_RT.
+pub const DHCP6_INF_MAX_RT = 3600000
+// REL_TIMEOUT.
+pub const DHCP6_REL_TIMEOUT = 1000
+// REL_MAX_RC.
+pub const DHCP6_REL_MAX_RC = 4
+// DEC_TIMEOUT.
+pub const DHCP6_DEC_TIMEOUT = 1000
+// DEC_MAX_RC.
+pub const DHCP6_DEC_MAX_RC = 4
+
+// A time later than any the client computes, for a lease that never ends.
+pub const DHCP6_NEVER = 0x7FFFFFFFFFFFF
+
+// The state of one client and its lease.
+pub @value
+struct Dhcp6Client
+    state: Int
+    // The kind of message the pending exchange begins with, while STARTING.
+    pending: Int
+    // The transaction identifier of the exchange in progress.
+    xid: Int
+    // When the exchange began, for the Elapsed Time option, in ms.
+    began: Int
+    // How many times the current message has been sent.
+    count: Int
+    // The current retransmission timeout, in ms.
+    rt: Int
+    // The time of the next retransmission or change of state, in ms.
+    next_at: Int
+    // The largest retransmission timeout and the largest number of
+    // transmissions of the exchange in progress; 0 is no limit.
+    mrt: Int
+    mrc: Int
+    // When the exchange in progress fails, in ms, or 0.
+    deadline: Int
+    flags: Int
+    iaid_na: Int
+    iaid_pd: Int
+    // SOL_MAX_RT and INF_MAX_RT in ms; a server can change them.
+    sol_max_rt: Int
+    inf_max_rt: Int
+    duid: Vec[u8; 130]
+    // The server the client talks to.
+    server: Vec[u8; 130]
+    has_server: Bool
+    unicast: Ip6Slot
+    // The best Advertise so far.
+    adv: Vec[u8; 130]
+    adv_pref: Int
+    has_adv: Bool
+    adv_unicast: Ip6Slot
+    // The address binding.
+    has_na: Bool
+    na_addr: dhcp6msg.Ip6
+    na_pref: Int
+    na_valid: Int
+    // The prefix binding.
+    has_pd: Bool
+    pd_prefix: dhcp6msg.Ip6
+    pd_len: Int
+    pd_pref: Int
+    pd_valid: Int
+    // The times the binding was given, in seconds from `bound_at`.
+    t1: Int
+    t2: Int
+    expires: Int
+    bound_at: Int
+    // The parameters.
+    dns1: dhcp6msg.Ip6
+    dns2: dhcp6msg.Ip6
+    ndns: Int
+    domains: Vec[u8; 128]
+    ntp: dhcp6msg.Ip6
+    has_ntp: Bool
+    refresh: Int
+
+// An address and whether it is set, for the optional Server Unicast
+// address of a server.
+pub @value
+struct Ip6Slot
+    addr: dhcp6msg.Ip6
+    set: Bool
+
+// A client in INIT that identifies itself by `duid`, with the `flags`
+// of the exchanges it takes part in and the identifiers of its
+// associations.  The first `client_tick` schedules the exchange.
+pub @tier(embedded)
+@no_alloc
+fn client_new(var duid: Vec[u8; 130], flags: Int, iaid_na: Int, iaid_pd: Int) -> Dhcp6Client
+    var c = Dhcp6Client { state: DHCP6_STATE_INIT, pending: 0, xid: 0, began: 0, count: 0, rt: 0,
+                          next_at: 0, mrt: 0, mrc: 0, deadline: 0, flags: flags,
+                          iaid_na: iaid_na, iaid_pd: iaid_pd,
+                          sol_max_rt: DHCP6_SOL_MAX_RT, inf_max_rt: DHCP6_INF_MAX_RT,
+                          duid: Vec.new(), server: Vec.new(), has_server: false,
+                          unicast: Ip6Slot { addr: dhcp6msg.ip6_zero(), set: false },
+                          adv: Vec.new(), adv_pref: 0, has_adv: false,
+                          adv_unicast: Ip6Slot { addr: dhcp6msg.ip6_zero(), set: false },
+                          has_na: false, na_addr: dhcp6msg.ip6_zero(), na_pref: 0, na_valid: 0,
+                          has_pd: false, pd_prefix: dhcp6msg.ip6_zero(), pd_len: 0, pd_pref: 0, pd_valid: 0,
+                          t1: 0, t2: 0, expires: 0, bound_at: 0,
+                          dns1: dhcp6msg.ip6_zero(), dns2: dhcp6msg.ip6_zero(), ndns: 0,
+                          domains: Vec.new(), ntp: dhcp6msg.ip6_zero(), has_ntp: false,
+                          refresh: 0 }
+    for i in 0..duid.len()
+        let _p = c.duid.push(duid[i])
+    c
+
+// ── Reading the client ──────────────────────────────────────────────
+
+// The state, one of `DHCP6_STATE_*`.
+pub @tier(embedded)
+@no_alloc
+fn client_state(var c: Dhcp6Client) -> Int
+    c.state
+
+// Whether the client holds an address or a prefix it may use.
+pub @tier(embedded)
+@no_alloc
+fn client_has_lease(var c: Dhcp6Client) -> Bool
+    (c.has_na or c.has_pd) and c.state != DHCP6_STATE_INIT and c.state != DHCP6_STATE_IDLE
+
+// The leased address, or ::.
+pub @tier(embedded)
+@no_alloc
+fn client_address(var c: Dhcp6Client) -> dhcp6msg.Ip6
+    c.na_addr
+
+// Whether the client holds an address.
+pub @tier(embedded)
+@no_alloc
+fn client_has_address(var c: Dhcp6Client) -> Bool
+    c.has_na
+
+// The delegated prefix, or ::.
+pub @tier(embedded)
+@no_alloc
+fn client_prefix(var c: Dhcp6Client) -> dhcp6msg.Ip6
+    c.pd_prefix
+
+// The length of the delegated prefix in bits.
+pub @tier(embedded)
+@no_alloc
+fn client_prefix_length(var c: Dhcp6Client) -> Int
+    c.pd_len
+
+// Whether the client holds a delegated prefix.
+pub @tier(embedded)
+@no_alloc
+fn client_has_prefix(var c: Dhcp6Client) -> Bool
+    c.has_pd
+
+// The `i`-th DNS server the lease gave, 0 or 1, or ::.
+pub @tier(embedded)
+@no_alloc
+fn client_dns(var c: Dhcp6Client, i: Int) -> dhcp6msg.Ip6
+    if i == 0 and c.ndns > 0
+        c.dns1
+    elif i == 1 and c.ndns > 1
+        c.dns2
+    else
+        dhcp6msg.ip6_zero()
+
+// How many DNS servers the lease gave, at most two.
+pub @tier(embedded)
+@no_alloc
+fn client_dns_count(var c: Dhcp6Client) -> Int
+    c.ndns
+
+// The offset after the name that starts at `at` in the domain search
+// list the lease gave, or -1 when the list does not hold a well-formed
+// name there.
+@tier(embedded)
+@no_alloc
+fn domain_end(var raw: Vec[u8; 128], at: Int) -> Int
+    var pos = at
+    var result = -1
+    var live = at >= 0
+    for _ in 0..130
+        if live
+            if pos >= raw.len()
+                live = false
+            else
+                let len = raw[pos] as Int
+                if len == 0
+                    result = pos + 1
+                    live = false
+                elif len > 63 or pos + 1 + len >= raw.len()
+                    live = false
+                else
+                    pos = pos + 1 + len
+    result
+
+// The offset in the search list of the `n`-th name, or -1.
+@tier(embedded)
+@no_alloc
+fn domain_start(var raw: Vec[u8; 128], n: Int) -> Int
+    var pos = 0
+    var k = 0
+    var result = -1
+    var live = n >= 0
+    for _ in 0..130
+        if live and pos < raw.len()
+            let nxt = domain_end(var raw, pos)
+            if nxt < 0
+                live = false
+            elif k == n
+                result = pos
+                live = false
+            else
+                k = k + 1
+                pos = nxt
+        else
+            live = false
+    result
+
+// Append one byte to a text buffer.
+@tier(embedded)
+@no_alloc
+fn push_text(var out: Vec[u8; 256], v: Int) -> Bool
+    match out.push((v & 255) as u8)
+        Ok(_)  => true
+        Err(_) => false
+
+// How many names the domain search list of the lease holds.
+pub @tier(embedded)
+@no_alloc
+fn client_domain_count(var c: Dhcp6Client) -> Int
+    var n = 0
+    for i in 0..64
+        if domain_start(var c.domains, i) >= 0
+            n = n + 1
+    n
+
+// The `n`-th name of the domain search list as text with the labels
+// joined by dots and no trailing dot, written into `out` (replacing its
+// content).  Answers false when there is no such name.
+pub @tier(embedded)
+@no_alloc
+fn client_domain_text(var c: Dhcp6Client, n: Int, var out: Vec[u8; 256]) -> Bool
+    out.clear()
+    let at = domain_start(var c.domains, n)
+    if at < 0
+        false
+    else
+        let end = domain_end(var c.domains, at)
+        var pos = at
+        var first = true
+        var ok = true
+        for _ in 0..130
+            if pos < end - 1
+                let len = c.domains[pos] as Int
+                if not first
+                    ok = ok and push_text(var out, 46)
+                first = false
+                for j in 0..len
+                    ok = ok and push_text(var out, c.domains[pos + 1 + j] as Int)
+                pos = pos + 1 + len
+        if first
+            ok = push_text(var out, 46)
+        ok
+
+// The address of the first NTP server the lease gave, or ::.
+pub @tier(embedded)
+@no_alloc
+fn client_ntp(var c: Dhcp6Client) -> dhcp6msg.Ip6
+    c.ntp
+
+// The address of the server a unicast message goes to, or ::.
+pub @tier(embedded)
+@no_alloc
+fn client_server_address(var c: Dhcp6Client) -> dhcp6msg.Ip6
+    c.unicast.addr
+
+// The identifier of the server the client talks to, replacing what
+// `d` held.  Answers false when the client has none yet.
+pub @tier(embedded)
+@no_alloc
+fn client_server_id(var c: Dhcp6Client, var d: Vec[u8; 130]) -> Bool
+    d.clear()
+    for i in 0..c.server.len()
+        let _p = d.push(c.server[i])
+    c.has_server
+
+// The transaction identifier of the exchange in progress.
+pub @tier(embedded)
+@no_alloc
+fn client_xid(var c: Dhcp6Client) -> Int
+    c.xid
+
+// When T1 passes, in the caller's milliseconds, or `DHCP6_NEVER`.
+pub @tier(embedded)
+@no_alloc
+fn client_t1_at(var c: Dhcp6Client) -> Int
+    at_secs(c.bound_at, c.t1)
+
+// When T2 passes, or `DHCP6_NEVER`.
+pub @tier(embedded)
+@no_alloc
+fn client_t2_at(var c: Dhcp6Client) -> Int
+    at_secs(c.bound_at, c.t2)
+
+// When the last lease ends, or `DHCP6_NEVER`.
+pub @tier(embedded)
+@no_alloc
+fn client_expires_at(var c: Dhcp6Client) -> Int
+    at_secs(c.bound_at, c.expires)
+
+// The time `secs` seconds after `base`, in ms, or `DHCP6_NEVER` for
+// infinity.
+@tier(embedded)
+@no_alloc
+fn at_secs(base: Int, secs: Int) -> Int
+    if secs >= dhcp6msg.DHCP6_INFINITY
+        DHCP6_NEVER
+    else
+        base + secs * 1000
+
+// When the client wants its next tick, in the caller's milliseconds, or
+// -1 when nothing is pending: an idle client, or one bound to a lease
+// that never ends.
+pub @tier(embedded)
+@no_alloc
+fn client_next_at(var c: Dhcp6Client) -> Int
+    var at = c.next_at
+    if c.state == DHCP6_STATE_IDLE
+        at = -1
+    elif c.state == DHCP6_STATE_BOUND
+        at = client_t1_at(var c)
+    if at >= DHCP6_NEVER
+        -1
+    else
+        at
+
+// Seconds of the last lease left at `now`, 0 when there is none or it
+// has ended, and the largest lifetime for one that never ends.
+pub @tier(embedded)
+@no_alloc
+fn client_remaining(var c: Dhcp6Client, now: Int) -> Int
+    let end = client_expires_at(var c)
+    if not (c.has_na or c.has_pd) or now >= end
+        0
+    elif end >= DHCP6_NEVER
+        dhcp6msg.DHCP6_INFINITY
+    else
+        (end - now) / 1000
+
+// Go back to INIT, ready to start again at the next tick.  The lease is
+// forgotten; `client_release` is the call that tells the server.
+pub @tier(embedded)
+@no_alloc
+fn client_restart(var c: Dhcp6Client)
+    c.state = DHCP6_STATE_INIT
+    c.next_at = 0
+    c.count = 0
+    c.has_adv = false
+    c.has_na = false
+    c.has_pd = false
+    c.has_server = false
+    c.unicast.set = false
+    c.deadline = 0
+
+// ── Retransmission (section 15) ─────────────────────────────────────
+
+// RAND times `rt`: a number between -0.1 and +0.1 of `rt`, chosen by
+// bits 8 to 23 of `random`.
+@tier(embedded)
+@no_alloc
+fn rand_part(rt: Int, random: Int) -> Int
+    let r = ((random >> 8) & 0xFFFF) % 2001 - 1000
+    rt * r / 10000
+
+// RAND times `rt` with RAND strictly above 0, for the first Solicit.
+@tier(embedded)
+@no_alloc
+fn rand_part_positive(rt: Int, random: Int) -> Int
+    let r = ((random >> 8) & 0xFFFF) % 1000 + 1
+    let v = rt * r / 10000
+    if v < 1
+        1
+    else
+        v
+
+// Bring `rt` under `mrt` with the randomisation of section 15, when
+// `mrt` is set.
+@tier(embedded)
+@no_alloc
+fn cap_rt(rt: Int, mrt: Int, random: Int) -> Int
+    if mrt > 0 and rt > mrt
+        mrt + rand_part(mrt, random)
+    else
+        rt
+
+// Seconds the elapsed time option carries, in hundredths.
+@tier(embedded)
+@no_alloc
+fn elapsed(var c: Dhcp6Client, now: Int) -> Int
+    if now <= c.began
+        0
+    else
+        (now - c.began) / 10
+
+// ── Building messages ───────────────────────────────────────────────
+
+// Whether a message of `kind` names the server.
+@tier(embedded)
+@no_alloc
+fn names_server(kind: Int) -> Bool
+    kind == dhcp6msg.DHCP6_REQUEST or kind == dhcp6msg.DHCP6_RENEW
+        or kind == dhcp6msg.DHCP6_RELEASE or kind == dhcp6msg.DHCP6_DECLINE
+
+// The Option Request option of a message of `kind`.
+@tier(embedded)
+@no_alloc
+fn put_request_list(var out: Vec[u8; 1024], kind: Int) -> Bool
+    var codes: Vec[u16; 16] = Vec.new()
+    let _1 = codes.push(dhcp6msg.DHCP6_OPT_DNS_SERVERS as u16)
+    let _2 = codes.push(dhcp6msg.DHCP6_OPT_DOMAIN_LIST as u16)
+    let _3 = codes.push(dhcp6msg.DHCP6_OPT_NTP_SERVER as u16)
+    if kind == dhcp6msg.DHCP6_INFORMATION_REQUEST
+        let _4 = codes.push(dhcp6msg.DHCP6_OPT_INF_MAX_RT as u16)
+        let _5 = codes.push(dhcp6msg.DHCP6_OPT_INFO_REFRESH_TIME as u16)
+    else
+        let _6 = codes.push(dhcp6msg.DHCP6_OPT_SOL_MAX_RT as u16)
+    dhcp6msg.put_option_request(var out, var codes)
+
+// The IA_NA option of a message of `kind`: the identifier, T1 and T2 of
+// zero, and the leased address when the message extends, confirms,
+// releases or declines it.
+@tier(embedded)
+@no_alloc
+fn put_na(var c: Dhcp6Client, var out: Vec[u8; 1024], kind: Int) -> Bool
+    let ia = dhcp6msg.open_ia_na(var out, c.iaid_na, 0, 0)
+    var ok = ia >= 0
+    if ok and c.has_na and kind != dhcp6msg.DHCP6_SOLICIT and kind != dhcp6msg.DHCP6_REQUEST
+        ok = dhcp6msg.put_ia_addr(var out, c.na_addr, 0, 0)
+    ok and dhcp6msg.close_option(var out, ia)
+
+// The IA_PD option of a message of `kind`: the identifier, T1 and T2 of
+// zero, and the delegated prefix when the message extends or releases
+// it.
+@tier(embedded)
+@no_alloc
+fn put_pd(var c: Dhcp6Client, var out: Vec[u8; 1024], kind: Int) -> Bool
+    let ia = dhcp6msg.open_ia_pd(var out, c.iaid_pd, 0, 0)
+    var ok = ia >= 0
+    if ok and c.has_pd and kind != dhcp6msg.DHCP6_SOLICIT and kind != dhcp6msg.DHCP6_REQUEST
+        ok = dhcp6msg.put_ia_prefix(var out, 0, 0, c.pd_len, c.pd_prefix)
+    ok and dhcp6msg.close_option(var out, ia)
+
+// A message of `kind` for the exchange in progress.
+@tier(embedded)
+@no_alloc
+fn build(var c: Dhcp6Client, now: Int, kind: Int, var out: Vec[u8; 1024]) -> Bool
+    var ok = dhcp6msg.begin(var out, kind, c.xid)
+    ok = ok and dhcp6msg.put_client_id(var out, var c.duid)
+    if ok and names_server(kind)
+        ok = dhcp6msg.put_server_id(var out, var c.server)
+    ok = ok and dhcp6msg.put_elapsed_time(var out, elapsed(var c, now))
+    if ok and kind != dhcp6msg.DHCP6_INFORMATION_REQUEST
+        if (c.flags & DHCP6_WANT_NA) != 0
+            ok = put_na(var c, var out, kind)
+        if ok and (c.flags & DHCP6_WANT_PD) != 0 and kind != dhcp6msg.DHCP6_DECLINE
+            ok = put_pd(var c, var out, kind)
+    if ok and kind != dhcp6msg.DHCP6_CONFIRM and kind != dhcp6msg.DHCP6_RELEASE and kind != dhcp6msg.DHCP6_DECLINE
+        ok = put_request_list(var out, kind)
+    if ok and kind == dhcp6msg.DHCP6_SOLICIT and (c.flags & DHCP6_RAPID_COMMIT) != 0
+        ok = dhcp6msg.put_rapid_commit(var out)
+    ok
+
+// Where a message of the exchange in progress goes: the server's own
+// address when it gave one and the exchange is one that section 18 lets
+// go to a single server, and the multicast address otherwise.
+@tier(embedded)
+@no_alloc
+fn send_action(var c: Dhcp6Client) -> Int
+    if c.unicast.set and (c.state == DHCP6_STATE_REQUEST or c.state == DHCP6_STATE_RENEW
+                          or c.state == DHCP6_STATE_RELEASE or c.state == DHCP6_STATE_DECLINE)
+        DHCP6_ACT_SEND_UNICAST
+    else
+        DHCP6_ACT_SEND
+
+// The kind of message each state sends.
+@tier(embedded)
+@no_alloc
+fn kind_of_state(state: Int) -> Int
+    if state == DHCP6_STATE_SOLICIT
+        dhcp6msg.DHCP6_SOLICIT
+    elif state == DHCP6_STATE_REQUEST
+        dhcp6msg.DHCP6_REQUEST
+    elif state == DHCP6_STATE_RENEW
+        dhcp6msg.DHCP6_RENEW
+    elif state == DHCP6_STATE_REBIND
+        dhcp6msg.DHCP6_REBIND
+    elif state == DHCP6_STATE_CONFIRM
+        dhcp6msg.DHCP6_CONFIRM
+    elif state == DHCP6_STATE_RELEASE
+        dhcp6msg.DHCP6_RELEASE
+    elif state == DHCP6_STATE_DECLINE
+        dhcp6msg.DHCP6_DECLINE
+    else
+        dhcp6msg.DHCP6_INFORMATION_REQUEST
+
+// Begin an exchange that sends `kind`: a new transaction, the first
+// timeout of section 15 with the parameters of the message, and the
+// message itself.  Answers the action.
+@tier(embedded)
+@no_alloc
+fn begin_exchange(var c: Dhcp6Client, now: Int, random: Int, kind: Int, var out: Vec[u8; 1024]) -> Int
+    var irt = DHCP6_SOL_TIMEOUT
+    c.mrc = 0
+    c.deadline = 0
+    if kind == dhcp6msg.DHCP6_SOLICIT
+        c.state = DHCP6_STATE_SOLICIT
+        c.mrt = c.sol_max_rt
+        c.has_adv = false
+    elif kind == dhcp6msg.DHCP6_REQUEST
+        c.state = DHCP6_STATE_REQUEST
+        irt = DHCP6_REQ_TIMEOUT
+        c.mrt = DHCP6_REQ_MAX_RT
+        c.mrc = DHCP6_REQ_MAX_RC
+    elif kind == dhcp6msg.DHCP6_RENEW
+        c.state = DHCP6_STATE_RENEW
+        irt = DHCP6_REN_TIMEOUT
+        c.mrt = DHCP6_REN_MAX_RT
+        c.deadline = client_t2_at(var c)
+    elif kind == dhcp6msg.DHCP6_REBIND
+        c.state = DHCP6_STATE_REBIND
+        irt = DHCP6_REB_TIMEOUT
+        c.mrt = DHCP6_REB_MAX_RT
+        c.deadline = client_expires_at(var c)
+    elif kind == dhcp6msg.DHCP6_CONFIRM
+        c.state = DHCP6_STATE_CONFIRM
+        irt = DHCP6_CNF_TIMEOUT
+        c.mrt = DHCP6_CNF_MAX_RT
+        c.deadline = now + DHCP6_CNF_MAX_RD
+    elif kind == dhcp6msg.DHCP6_RELEASE
+        c.state = DHCP6_STATE_RELEASE
+        irt = DHCP6_REL_TIMEOUT
+        c.mrt = 0
+        c.mrc = DHCP6_REL_MAX_RC
+    elif kind == dhcp6msg.DHCP6_DECLINE
+        c.state = DHCP6_STATE_DECLINE
+        irt = DHCP6_DEC_TIMEOUT
+        c.mrt = 0
+        c.mrc = DHCP6_DEC_MAX_RC
+    else
+        c.state = DHCP6_STATE_INFORM
+        irt = DHCP6_INF_TIMEOUT
+        c.mrt = c.inf_max_rt
+    c.xid = random & 0xFFFFFF
+    c.began = now
+    c.count = 1
+    if kind == dhcp6msg.DHCP6_SOLICIT
+        c.rt = irt + rand_part_positive(irt, random)
+    else
+        c.rt = irt + rand_part(irt, random)
+    c.rt = cap_rt(c.rt, c.mrt, random)
+    c.next_at = now + c.rt
+    if build(var c, now, kind, var out)
+        send_action(var c)
+    else
+        DHCP6_ACT_NONE
+
+// Send the message of the exchange in progress again, with the next
+// timeout of section 15.
+@tier(embedded)
+@no_alloc
+fn retransmit(var c: Dhcp6Client, now: Int, random: Int, var out: Vec[u8; 1024]) -> Int
+    c.count = c.count + 1
+    c.rt = cap_rt(2 * c.rt + rand_part(c.rt, random), c.mrt, random)
+    c.next_at = now + c.rt
+    if build(var c, now, kind_of_state(c.state), var out)
+        send_action(var c)
+    else
+        DHCP6_ACT_NONE
+
+// Choose the best Advertise held and send the Request for it.
+@tier(embedded)
+@no_alloc
+fn select_server(var c: Dhcp6Client, now: Int, random: Int, var out: Vec[u8; 1024]) -> Int
+    c.server.clear()
+    for i in 0..c.adv.len()
+        let _p = c.server.push(c.adv[i])
+    c.has_server = true
+    c.unicast = c.adv_unicast
+    begin_exchange(var c, now, random, dhcp6msg.DHCP6_REQUEST, var out)
+
+// ── Stepping ────────────────────────────────────────────────────────
+
+// Forget the lease and go to INIT.
+@tier(embedded)
+@no_alloc
+fn lose_lease(var c: Dhcp6Client, now: Int)
+    client_restart(var c)
+    c.next_at = now
+
+// The client's timers, called when `client_next_at` passes and at any
+// other time (a call before it does nothing).
+//
+// `random` is a random 32-bit word from the caller.  Answers an action;
+// for `DHCP6_ACT_SEND` and `DHCP6_ACT_SEND_UNICAST` the datagram to write
+// is in `out`.
+//
+// - INIT schedules the first message after a random delay of up to a
+//   second, and STARTING sends it: a Solicit, or an Information-request
+//   for a stateless client.
+// - SOLICIT picks the best Advertise when the first timeout ends and
+//   sends a Request, or sends the Solicit again.
+// - REQUEST sends again, and after `DHCP6_REQ_MAX_RC` transmissions
+//   answers `DHCP6_ACT_FAILED` and starts over.
+// - BOUND starts a Renew at T1, RENEW starts a Rebind at T2 and REBIND
+//   ends the lease with `DHCP6_ACT_EXPIRED`.
+// - CONFIRM, after ten seconds, goes back to BOUND, as section 18.2.3
+//   says to keep using the leases.
+// - RELEASE and DECLINE end after four transmissions.
+// - INFORMED sends a new Information-request when the refresh time ends.
+pub @tier(embedded)
+@no_alloc
+fn client_tick(var c: Dhcp6Client, now: Int, random: Int, var out: Vec[u8; 1024]) -> Int
+    if c.state == DHCP6_STATE_INIT
+        if now >= c.next_at
+            c.state = DHCP6_STATE_STARTING
+            if (c.flags & DHCP6_STATELESS) != 0
+                c.pending = dhcp6msg.DHCP6_INFORMATION_REQUEST
+                c.next_at = now + ((random >> 8) & 0xFFFF) % (DHCP6_INF_MAX_DELAY + 1)
+            else
+                c.pending = dhcp6msg.DHCP6_SOLICIT
+                c.next_at = now + ((random >> 8) & 0xFFFF) % (DHCP6_SOL_MAX_DELAY + 1)
+    elif c.state == DHCP6_STATE_STARTING
+        if now >= c.next_at
+            return begin_exchange(var c, now, random, c.pending, var out)
+    elif c.state == DHCP6_STATE_BOUND
+        if now >= client_t1_at(var c)
+            return begin_exchange(var c, now, random, dhcp6msg.DHCP6_RENEW, var out)
+    elif c.state == DHCP6_STATE_INFORMED
+        if now >= c.next_at
+            return begin_exchange(var c, now, random, dhcp6msg.DHCP6_INFORMATION_REQUEST, var out)
+    elif c.state != DHCP6_STATE_IDLE
+        return tick_exchange(var c, now, random, var out)
+    DHCP6_ACT_NONE
+
+// The timers of a state that has a message out.
+@tier(embedded)
+@no_alloc
+fn tick_exchange(var c: Dhcp6Client, now: Int, random: Int, var out: Vec[u8; 1024]) -> Int
+    if c.deadline > 0 and now >= c.deadline
+        return end_by_deadline(var c, now, random, var out)
+    if now < c.next_at
+        return DHCP6_ACT_NONE
+    if c.state == DHCP6_STATE_SOLICIT and c.has_adv
+        return select_server(var c, now, random, var out)
+    if c.mrc > 0 and c.count >= c.mrc
+        return end_by_count(var c, now)
+    retransmit(var c, now, random, var out)
+
+// An exchange whose duration ran out.
+@tier(embedded)
+@no_alloc
+fn end_by_deadline(var c: Dhcp6Client, now: Int, random: Int, var out: Vec[u8; 1024]) -> Int
+    if c.state == DHCP6_STATE_RENEW
+        begin_exchange(var c, now, random, dhcp6msg.DHCP6_REBIND, var out)
+    elif c.state == DHCP6_STATE_REBIND
+        lose_lease(var c, now)
+        DHCP6_ACT_EXPIRED
+    else
+        // A Confirm that no server answered: keep using the leases.
+        c.state = DHCP6_STATE_BOUND
+        c.deadline = 0
+        DHCP6_ACT_NONE
+
+// An exchange that used its transmissions.
+@tier(embedded)
+@no_alloc
+fn end_by_count(var c: Dhcp6Client, now: Int) -> Int
+    if c.state == DHCP6_STATE_RELEASE or c.state == DHCP6_STATE_DECLINE
+        client_restart(var c)
+        c.state = DHCP6_STATE_IDLE
+        DHCP6_ACT_RELEASED
+    else
+        lose_lease(var c, now)
+        DHCP6_ACT_FAILED
+
+// ── Receiving ───────────────────────────────────────────────────────
+
+// Whether a message belongs to the exchange in progress: a valid
+// Advertise or Reply with this client's transaction identifier, this
+// client's DUID in its Client Identifier, and a Server Identifier.
+@tier(embedded)
+@no_alloc
+fn is_for_me(var c: Dhcp6Client, var msg: Vec[u8; 1024]) -> Bool
+    let kind = dhcp6msg.msg_type(var msg)
+    let cid = dhcp6msg.find(var msg, dhcp6msg.DHCP6_OPT_CLIENTID)
+    dhcp6msg.validate(var msg) == dhcp6msg.DHCP6_FAULT_NONE
+        and (kind == dhcp6msg.DHCP6_ADVERTISE or kind == dhcp6msg.DHCP6_REPLY)
+        and dhcp6msg.xid(var msg) == c.xid
+        and cid >= 0
+        and dhcp6msg.option_equals_duid(var msg, cid, var c.duid)
+        and dhcp6msg.find(var msg, dhcp6msg.DHCP6_OPT_SERVERID) >= 0
+
+// Whether a message came from the server the client has chosen.
+@tier(embedded)
+@no_alloc
+fn is_from_server(var c: Dhcp6Client, var msg: Vec[u8; 1024]) -> Bool
+    let sid = dhcp6msg.find(var msg, dhcp6msg.DHCP6_OPT_SERVERID)
+    c.has_server and dhcp6msg.option_equals_duid(var msg, sid, var c.server)
+
+// Take the server named in a message as the one the client talks to.
+@tier(embedded)
+@no_alloc
+fn adopt_server(var c: Dhcp6Client, var msg: Vec[u8; 1024])
+    let sid = dhcp6msg.find(var msg, dhcp6msg.DHCP6_OPT_SERVERID)
+    c.has_server = dhcp6msg.read_duid(var msg, sid, var c.server)
+    if dhcp6opt.has_server_unicast(var msg)
+        c.unicast = Ip6Slot { addr: dhcp6opt.server_unicast(var msg), set: true }
+
+// Take SOL_MAX_RT and INF_MAX_RT from a message, which section 18.2.9
+// and 18.2.10 say to do whatever else the message holds.
+@tier(embedded)
+@no_alloc
+fn take_max_rt(var c: Dhcp6Client, var msg: Vec[u8; 1024])
+    let s = dhcp6opt.sol_max_rt(var msg)
+    if s > 0
+        c.sol_max_rt = s * 1000
+    let i = dhcp6opt.inf_max_rt(var msg)
+    if i > 0
+        c.inf_max_rt = i * 1000
+
+// Take the configuration options of a Reply.  An option the Reply does
+// not carry is forgotten, as section 18.2.10 says.
+@tier(embedded)
+@no_alloc
+fn take_options(var c: Dhcp6Client, var msg: Vec[u8; 1024])
+    let n = dhcp6opt.dns_server_count(var msg)
+    c.ndns = 0
+    if n > 0
+        c.dns1 = dhcp6opt.dns_server(var msg, 0)
+        c.ndns = 1
+    if n > 1
+        c.dns2 = dhcp6opt.dns_server(var msg, 1)
+        c.ndns = 2
+    c.domains.clear()
+    let d = dhcp6msg.find(var msg, dhcp6msg.DHCP6_OPT_DOMAIN_LIST)
+    if d >= 0 and dhcp6msg.opt_len(var msg, d) <= 128
+        for i in dhcp6msg.opt_data(d)..dhcp6msg.opt_end(var msg, d)
+            let _p = c.domains.push(msg[i])
+    c.has_ntp = false
+    let ntp = dhcp6msg.find(var msg, dhcp6msg.DHCP6_OPT_NTP_SERVER)
+    if ntp >= 0
+        let sub = dhcp6opt.ntp_suboption(var msg, ntp, dhcp6opt.DHCP6_NTP_SRV_ADDR, 0)
+        if sub >= 0
+            c.ntp = dhcp6opt.ntp_address(var msg, sub)
+            c.has_ntp = true
+
+// What an IA in a Reply says: 0 when there is nothing to take, 1 when it
+// holds a usable binding, 2 when the server refused it.
+@tier(embedded)
+@no_alloc
+fn ia_verdict(var msg: Vec[u8; 1024], ia: Int) -> Int
+    if ia < 0 or not dhcp6opt.ia_is_usable(var msg, ia)
+        return 0
+    let st = dhcp6opt.status_code(var msg, dhcp6opt.ia_options_start(ia), dhcp6msg.opt_end(var msg, ia))
+    if st == dhcp6msg.DHCP6_STATUS_NO_BINDING or st == dhcp6msg.DHCP6_STATUS_NOT_ON_LINK
+        2
+    elif st == 0
+        1
+    else
+        0
+
+// The offset of the first IA Address in the IA at `ia` that the client
+// can use, or -1; an address with a valid lifetime of zero is not one.
+@tier(embedded)
+@no_alloc
+fn usable_address(var msg: Vec[u8; 1024], ia: Int) -> Int
+    var found = -1
+    for i in 0..16
+        if found < 0
+            let a = dhcp6msg.find_option(var msg, dhcp6opt.ia_options_start(ia), dhcp6msg.opt_end(var msg, ia), dhcp6msg.DHCP6_OPT_IAADDR, i)
+            if a >= 0 and dhcp6opt.iaaddr_is_usable(var msg, a) and dhcp6opt.iaaddr_valid(var msg, a) > 0
+                found = a
+    found
+
+// The offset of the first IA Prefix in the IA at `ia` that the client
+// can use, or -1.
+@tier(embedded)
+@no_alloc
+fn usable_prefix(var msg: Vec[u8; 1024], ia: Int) -> Int
+    var found = -1
+    for i in 0..16
+        if found < 0
+            let a = dhcp6msg.find_option(var msg, dhcp6opt.ia_options_start(ia), dhcp6msg.opt_end(var msg, ia), dhcp6msg.DHCP6_OPT_IAPREFIX, i)
+            if a >= 0 and dhcp6opt.iaprefix_is_usable(var msg, a) and dhcp6opt.iaprefix_valid(var msg, a) > 0
+                found = a
+    found
+
+// The smaller of two lifetimes, both in seconds.
+@tier(embedded)
+@no_alloc
+fn min_secs(a: Int, b: Int) -> Int
+    if a < b
+        a
+    else
+        b
+
+// The larger of two lifetimes, both in seconds.
+@tier(embedded)
+@no_alloc
+fn max_secs(a: Int, b: Int) -> Int
+    if a > b
+        a
+    else
+        b
+
+// Take the bindings a Reply grants.  Answers 0 when the Reply carries
+// none the client can use, 1 when it granted at least one, and 2 when
+// the server said the client's bindings are not valid.
+//
+// T1 and T2 are the earliest the IAs give, each computed with the rules
+// of section 14.2 when the server left it at zero; the lease ends when
+// the longest valid lifetime does.
+@tier(embedded)
+@no_alloc
+fn take_bindings(var c: Dhcp6Client, now: Int, var msg: Vec[u8; 1024]) -> Int
+    var verdict = 0
+    var t1 = dhcp6msg.DHCP6_INFINITY
+    var t2 = dhcp6msg.DHCP6_INFINITY
+    var expires = 0
+    var got = false
+    if (c.flags & DHCP6_WANT_NA) != 0
+        let ia = dhcp6opt.find_ia(var msg, dhcp6msg.DHCP6_OPT_IA_NA, c.iaid_na)
+        let v = ia_verdict(var msg, ia)
+        if v == 2
+            verdict = 2
+        elif v == 1
+            let a = usable_address(var msg, ia)
+            if a >= 0
+                c.has_na = true
+                c.na_addr = dhcp6opt.iaaddr_address(var msg, a)
+                c.na_pref = dhcp6opt.iaaddr_preferred(var msg, a)
+                c.na_valid = dhcp6opt.iaaddr_valid(var msg, a)
+                t1 = min_secs(t1, dhcp6opt.choose_t1(dhcp6opt.ia_t1(var msg, ia), c.na_pref))
+                t2 = min_secs(t2, dhcp6opt.choose_t2(dhcp6opt.ia_t2(var msg, ia), c.na_pref))
+                expires = max_secs(expires, c.na_valid)
+                got = true
+            elif c.has_na and iaaddr_withdrawn(var msg, ia)
+                c.has_na = false
+    if (c.flags & DHCP6_WANT_PD) != 0
+        let ia = dhcp6opt.find_ia(var msg, dhcp6msg.DHCP6_OPT_IA_PD, c.iaid_pd)
+        let v = ia_verdict(var msg, ia)
+        if v == 2
+            verdict = 2
+        elif v == 1
+            let a = usable_prefix(var msg, ia)
+            if a >= 0
+                c.has_pd = true
+                c.pd_prefix = dhcp6opt.iaprefix_prefix(var msg, a)
+                c.pd_len = dhcp6opt.iaprefix_length(var msg, a)
+                c.pd_pref = dhcp6opt.iaprefix_preferred(var msg, a)
+                c.pd_valid = dhcp6opt.iaprefix_valid(var msg, a)
+                t1 = min_secs(t1, dhcp6opt.choose_t1(dhcp6opt.ia_t1(var msg, ia), c.pd_pref))
+                t2 = min_secs(t2, dhcp6opt.choose_t2(dhcp6opt.ia_t2(var msg, ia), c.pd_pref))
+                expires = max_secs(expires, c.pd_valid)
+                got = true
+    if verdict == 0 and got
+        verdict = 1
+        c.t1 = t1
+        c.t2 = max_secs(t1, t2)
+        c.expires = expires
+        c.bound_at = now
+    verdict
+
+// Whether the IA at `ia` holds an address with a valid lifetime of zero,
+// which tells the client the server took the address back.
+@tier(embedded)
+@no_alloc
+fn iaaddr_withdrawn(var msg: Vec[u8; 1024], ia: Int) -> Bool
+    var gone = false
+    for i in 0..16
+        let a = dhcp6msg.find_option(var msg, dhcp6opt.ia_options_start(ia), dhcp6msg.opt_end(var msg, ia), dhcp6msg.DHCP6_OPT_IAADDR, i)
+        if a >= 0 and dhcp6opt.iaaddr_is_usable(var msg, a) and dhcp6opt.iaaddr_valid(var msg, a) == 0
+            gone = true
+    gone
+
+// Whether an Advertise holds an address or prefix for an IA the client
+// asked for (section 18.2.9).
+@tier(embedded)
+@no_alloc
+fn advert_is_useful(var c: Dhcp6Client, var msg: Vec[u8; 1024]) -> Bool
+    var useful = false
+    if (c.flags & DHCP6_WANT_NA) != 0
+        let ia = dhcp6opt.find_ia(var msg, dhcp6msg.DHCP6_OPT_IA_NA, c.iaid_na)
+        if ia_verdict(var msg, ia) == 1 and usable_address(var msg, ia) >= 0
+            useful = true
+    if (c.flags & DHCP6_WANT_PD) != 0
+        let ia = dhcp6opt.find_ia(var msg, dhcp6msg.DHCP6_OPT_IA_PD, c.iaid_pd)
+        if ia_verdict(var msg, ia) == 1 and usable_prefix(var msg, ia) >= 0
+            useful = true
+    useful
+
+// Settle a Reply that granted bindings.
+@tier(embedded)
+@no_alloc
+fn become_bound(var c: Dhcp6Client, var msg: Vec[u8; 1024]) -> Int
+    take_options(var c, var msg)
+    c.state = DHCP6_STATE_BOUND
+    c.deadline = 0
+    c.count = 0
+    DHCP6_ACT_BOUND
+
+// A datagram arrived from the network.
+//
+// A message that is not an answer to this client's exchange, or that
+// does not fit the state, is ignored and answers `DHCP6_ACT_NONE`.
+//
+// - SOLICIT keeps the Advertise with the highest preference.  A
+//   preference of 255, or an Advertise that arrives after the first
+//   timeout, sends the Request at once; otherwise the Request goes at
+//   the first timeout, from `client_tick`.  A Reply with Rapid Commit,
+//   to a Solicit that asked for it, is taken as the answer to a Request.
+// - REQUEST, RENEW and REBIND take a Reply: bindings in it move the
+//   client to BOUND and answer `DHCP6_ACT_BOUND`, a refusal answers
+//   `DHCP6_ACT_REJECTED`, and UseMulticast sends the message again to
+//   the multicast address.
+// - CONFIRM takes a Reply: Success answers `DHCP6_ACT_CONFIRMED` and
+//   NotOnLink answers `DHCP6_ACT_REJECTED`.
+// - RELEASE and DECLINE take a Reply and answer `DHCP6_ACT_RELEASED`.
+// - INFORM takes a Reply and answers `DHCP6_ACT_INFORMED`.
+//
+// A Reconfigure message is ignored in every state: section 20.4 requires
+// it to be authenticated, and this package does not verify
+// authentication.
+pub @tier(embedded)
+@no_alloc
+fn client_receive(var c: Dhcp6Client, now: Int, random: Int, var msg: Vec[u8; 1024], var out: Vec[u8; 1024]) -> Int
+    if not is_for_me(var c, var msg)
+        return DHCP6_ACT_NONE
+    if c.state == DHCP6_STATE_SOLICIT
+        return receive_solicit(var c, now, random, var msg, var out)
+    if dhcp6msg.msg_type(var msg) != dhcp6msg.DHCP6_REPLY
+        return DHCP6_ACT_NONE
+    take_max_rt(var c, var msg)
+    if c.state == DHCP6_STATE_INFORM
+        return receive_info(var c, now, var msg)
+    if c.state == DHCP6_STATE_REQUEST or c.state == DHCP6_STATE_RENEW
+        if not is_from_server(var c, var msg)
+            return DHCP6_ACT_NONE
+    elif c.state == DHCP6_STATE_RELEASE or c.state == DHCP6_STATE_DECLINE
+        if not is_from_server(var c, var msg)
+            return DHCP6_ACT_NONE
+        client_restart(var c)
+        c.state = DHCP6_STATE_IDLE
+        return DHCP6_ACT_RELEASED
+    elif c.state != DHCP6_STATE_REBIND and c.state != DHCP6_STATE_CONFIRM
+        return DHCP6_ACT_NONE
+    receive_reply(var c, now, random, var msg, var out)
+
+// A message while a Solicit is out.
+@tier(embedded)
+@no_alloc
+fn receive_solicit(var c: Dhcp6Client, now: Int, random: Int, var msg: Vec[u8; 1024], var out: Vec[u8; 1024]) -> Int
+    let kind = dhcp6msg.msg_type(var msg)
+    take_max_rt(var c, var msg)
+    let st = dhcp6opt.message_status(var msg)
+    if kind == dhcp6msg.DHCP6_REPLY
+        if (c.flags & DHCP6_RAPID_COMMIT) != 0 and dhcp6opt.has_rapid_commit(var msg) and st == 0
+            let got = take_bindings(var c, now, var msg)
+            if got == 1
+                adopt_server(var c, var msg)
+                return become_bound(var c, var msg)
+        return DHCP6_ACT_NONE
+    if st == dhcp6msg.DHCP6_STATUS_NO_ADDRS_AVAIL or st == dhcp6msg.DHCP6_STATUS_NO_PREFIX_AVAIL
+        return DHCP6_ACT_NONE
+    if st != 0 or not advert_is_useful(var c, var msg)
+        return DHCP6_ACT_NONE
+    let pref = dhcp6opt.preference(var msg)
+    if not c.has_adv or pref > c.adv_pref
+        let sid = dhcp6msg.find(var msg, dhcp6msg.DHCP6_OPT_SERVERID)
+        c.has_adv = dhcp6msg.read_duid(var msg, sid, var c.adv)
+        c.adv_pref = pref
+        c.adv_unicast = Ip6Slot { addr: dhcp6opt.server_unicast(var msg), set: dhcp6opt.has_server_unicast(var msg) }
+    if c.has_adv and (pref == 255 or c.count > 1)
+        return select_server(var c, now, random, var out)
+    DHCP6_ACT_NONE
+
+// A Reply while an Information-request is out.
+@tier(embedded)
+@no_alloc
+fn receive_info(var c: Dhcp6Client, now: Int, var msg: Vec[u8; 1024]) -> Int
+    if dhcp6opt.message_status(var msg) != 0
+        return DHCP6_ACT_NONE
+    take_options(var c, var msg)
+    adopt_server(var c, var msg)
+    c.refresh = dhcp6opt.info_refresh_time(var msg)
+    c.state = DHCP6_STATE_INFORMED
+    c.next_at = at_secs(now, c.refresh)
+    c.deadline = 0
+    DHCP6_ACT_INFORMED
+
+// A Reply while a Request, Renew, Rebind or Confirm is out.
+@tier(embedded)
+@no_alloc
+fn receive_reply(var c: Dhcp6Client, now: Int, random: Int, var msg: Vec[u8; 1024], var out: Vec[u8; 1024]) -> Int
+    let st = dhcp6opt.message_status(var msg)
+    if st == dhcp6msg.DHCP6_STATUS_USE_MULTICAST
+        if c.unicast.set
+            c.unicast.set = false
+            return begin_exchange(var c, now, random, kind_of_state(c.state), var out)
+        return DHCP6_ACT_NONE
+    if c.state == DHCP6_STATE_CONFIRM
+        if st == dhcp6msg.DHCP6_STATUS_SUCCESS
+            c.state = DHCP6_STATE_BOUND
+            c.deadline = 0
+            return DHCP6_ACT_CONFIRMED
+        if st == dhcp6msg.DHCP6_STATUS_NOT_ON_LINK
+            lose_lease(var c, now)
+            return DHCP6_ACT_REJECTED
+        return DHCP6_ACT_NONE
+    if st != 0
+        // The server refused the whole message.
+        if c.state == DHCP6_STATE_REQUEST
+            lose_lease(var c, now)
+            return DHCP6_ACT_REJECTED
+        return DHCP6_ACT_NONE
+    let got = take_bindings(var c, now, var msg)
+    if got == 2
+        lose_lease(var c, now)
+        return DHCP6_ACT_REJECTED
+    if got == 1
+        adopt_server(var c, var msg)
+        return become_bound(var c, var msg)
+    DHCP6_ACT_NONE
+
+// ── Giving the lease up ─────────────────────────────────────────────
+
+// Tell the server the client no longer uses its address and prefix
+// (section 18.2.7).  Builds a Release in `out` and answers the action;
+// the client begins its four attempts, and answers `DHCP6_ACT_RELEASED`
+// from `client_receive` or `client_tick` when they end.  A client with
+// no lease builds nothing and answers `DHCP6_ACT_NONE`.
+pub @tier(embedded)
+@no_alloc
+fn client_release(var c: Dhcp6Client, now: Int, random: Int, var out: Vec[u8; 1024]) -> Int
+    if not (c.has_na or c.has_pd) or not c.has_server or c.state < DHCP6_STATE_BOUND or c.state > DHCP6_STATE_REBIND
+        return DHCP6_ACT_NONE
+    begin_exchange(var c, now, random, dhcp6msg.DHCP6_RELEASE, var out)
+
+// Tell the server the address is in use by another host, which the
+// client found by probing it (section 18.2.8).  Builds a Decline in
+// `out`; the addresses and not the prefix are declined.  A client with
+// no address builds nothing and answers `DHCP6_ACT_NONE`.
+pub @tier(embedded)
+@no_alloc
+fn client_decline(var c: Dhcp6Client, now: Int, random: Int, var out: Vec[u8; 1024]) -> Int
+    if not c.has_na or not c.has_server or c.state < DHCP6_STATE_BOUND or c.state > DHCP6_STATE_REBIND
+        return DHCP6_ACT_NONE
+    begin_exchange(var c, now, random, dhcp6msg.DHCP6_DECLINE, var out)
+
+// Ask whether the addresses are still on the link, after the caller saw
+// the link change (section 18.2.3).  The Confirm goes after a random
+// delay of up to a second, from `client_tick`.  Answers false when the
+// client has no address or has a prefix, which Confirm cannot check.
+pub @tier(embedded)
+@no_alloc
+fn client_confirm(var c: Dhcp6Client, now: Int, random: Int) -> Bool
+    if not c.has_na or c.has_pd or c.state < DHCP6_STATE_BOUND or c.state > DHCP6_STATE_REBIND
+        false
+    else
+        c.state = DHCP6_STATE_STARTING
+        c.pending = dhcp6msg.DHCP6_CONFIRM
+        c.next_at = now + ((random >> 8) & 0xFFFF) % (DHCP6_CNF_MAX_DELAY + 1)
+        true

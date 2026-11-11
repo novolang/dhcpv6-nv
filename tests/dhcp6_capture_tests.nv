@@ -1,0 +1,264 @@
+// dhcp6_capture_tests.nv — messages from a capture somebody else made.
+//
+// The capture is `DHCPv6.pcap` from the Wireshark sample captures page
+// (https://wiki.wireshark.org/SampleCaptures, the file at
+// https://wiki.wireshark.org/uploads/__moin_import__/attachments/SampleCaptures/DHCPv6.pcap,
+// 1,627 bytes).  It records a client at link-local fe80::a00:27ff:fefe:8f95
+// asking a server at fe80::a00:27ff:fed4:10bb for a delegated prefix.  The
+// UDP payloads of packets 2, 5, 7, 8, 11 and 12 are copied below as
+// hexadecimal text, a Solicit, an Advertise, a Request, a Reply, a
+// Release and the Reply that answers it.  Every field the tests assert
+// was read off the bytes by hand, with the layout of RFC 8415 section 21
+// beside it.
+//
+// The Solicit and the Request are also rebuilt by the writers and
+// compared to the capture byte for byte.
+
+use std.test
+use std.bytes
+use dhcp6msg
+use dhcp6opt
+
+// A message from hexadecimal text.
+fn load(hex: Str) -> Vec[u8; 1024]
+    var m: Vec[u8; 1024] = Vec.new()
+    for b in bytes.to_byte_list(bytes.from_hex(hex) ?? bytes.zeros(0))
+        let _p = m.push(b)
+    m
+
+// Packet 2: SOLICIT, xid 0x100874.
+//   01 100874                        type, transaction identifier
+//   0001 000e                        Client Identifier, 14 bytes:
+//     0001 0001 1c39cf88 080027fe8f95  DUID-LLT, Ethernet, time 0x1c39cf88, MAC
+//   0006 0004 0017 0018              Option Request: 23 (DNS), 24 (domains)
+//   0008 0002 0000                   Elapsed Time 0
+//   0019 000c                        IA_PD, 12 bytes: IAID 27fe8f95, T1 0xe10 = 3600, T2 0x1518 = 5400
+fn solicit_hex() -> Str
+    "011008740001000e000100011c39cf88080027fe8f9500060004001700180008000200000019000c27fe8f9500000e1000001518"
+
+// Packet 5: ADVERTISE, xid 0x100874.
+//   0019 0029                        IA_PD, 41 bytes: IAID 27fe8f95, T1 0, T2 0
+//     001a 0019                      IA Prefix, 25 bytes
+//       00001194 00001c20            preferred 4500, valid 7200
+//       40                           prefix length 64
+//       20010000 0000fe00 00000000 00000000   prefix 2001:0:0:fe00::
+//   0001 000e ...                    the client's DUID
+//   0002 000e 0001 0001 1c3825e8 080027d410bb   the server's DUID-LLT
+fn advertise_hex() -> Str
+    "021008740019002927fe8f950000000000000000001a00190000119400001c2040200100000000fe0000000000000000000001000e000100011c39cf88080027fe8f950002000e000100011c3825e8080027d410bb"
+
+// Packet 7: REQUEST, xid 0x49174e: the server's DUID, an Option Request,
+// Elapsed Time 0 and the IA_PD with the prefix of the Advertise and its
+// lifetimes 7200 and 7500.
+fn request_hex() -> Str
+    "0349174e0001000e000100011c39cf88080027fe8f950002000e000100011c3825e8080027d410bb00060004001700180008000200000019002927fe8f9500000e1000001518001a001900001c2000001d4c40200100000000fe000000000000000000"
+
+// Packet 8: REPLY to the Request, xid 0x49174e.
+fn reply_hex() -> Str
+    "0749174e0019002927fe8f950000000000000000001a00190000119400001c2040200100000000fe0000000000000000000001000e000100011c39cf88080027fe8f950002000e000100011c3825e8080027d410bb"
+
+// Packet 11: RELEASE, xid 0xc789b0: the same IA_PD with the lifetimes 0.
+fn release_hex() -> Str
+    "08c789b00001000e000100011c39cf88080027fe8f950002000e000100011c3825e8080027d410bb00060004001700180008000200000019002927fe8f950000000000000000001a0019000000000000000040200100000000fe000000000000000000"
+
+// Packet 12: REPLY to the Release, xid 0xc789b0, with a Status Code
+// option of 19 bytes: status 0 and the message "Release received."
+fn release_reply_hex() -> Str
+    "07c789b00001000e000100011c39cf88080027fe8f950002000e000100011c3825e8080027d410bb000d0013000052656c656173652072656365697665642e"
+
+// The client's DUID: DUID-LLT, hardware type 1, time 0x1c39cf88, and
+// 08:00:27:fe:8f:95.
+fn client_duid() -> Vec[u8; 130]
+    var d: Vec[u8; 130] = Vec.new()
+    var ll: Vec[u8; 128] = Vec.new()
+    for b in [0x08, 0x00, 0x27, 0xfe, 0x8f, 0x95]
+        let _p = ll.push(b as u8)
+    let _ok = dhcp6msg.duid_llt(var d, 1, 0x1c39cf88, var ll)
+    d
+
+@test
+fn test_the_captured_solicit_is_read_field_by_field() [io]
+    var m = load(solicit_hex())
+    test.assert_eq(m.len(), 52)
+    test.assert_eq(dhcp6msg.validate(var m), dhcp6msg.DHCP6_FAULT_NONE)
+    test.assert_eq(dhcp6msg.msg_type(var m), dhcp6msg.DHCP6_SOLICIT)
+    test.assert_eq(dhcp6msg.xid(var m), 0x100874)
+    test.assert_eq(dhcp6msg.is_relay(var m), false)
+
+    test.case("the Client Identifier is a DUID-LLT")
+    let cid = dhcp6msg.find(var m, dhcp6msg.DHCP6_OPT_CLIENTID)
+    test.assert_eq(cid, 4)
+    test.assert_eq(dhcp6msg.opt_len(var m, cid), 14)
+    test.assert_eq(dhcp6msg.duid_type_at(var m, dhcp6msg.opt_data(cid)), dhcp6msg.DHCP6_DUID_LLT)
+    var mine = client_duid()
+    test.assert_eq(dhcp6msg.option_equals_duid(var m, cid, var mine), true)
+
+    test.case("the Option Request lists DNS servers and the domain list")
+    test.assert_eq(dhcp6opt.oro_count(var m), 2)
+    test.assert_eq(dhcp6opt.oro_code(var m, 0), 23)
+    test.assert_eq(dhcp6opt.oro_code(var m, 1), 24)
+    test.assert_eq(dhcp6opt.oro_contains(var m, 24), true)
+    test.assert_eq(dhcp6opt.oro_contains(var m, 82), false)
+
+    test.case("the Elapsed Time is zero")
+    test.assert_eq(dhcp6opt.elapsed_time(var m), 0)
+
+    test.case("the IA_PD asks with T1 3600 and T2 5400 and holds no prefix")
+    let ia = dhcp6opt.find_ia(var m, dhcp6msg.DHCP6_OPT_IA_PD, 0x27fe8f95)
+    test.assert_eq(ia, 36)
+    test.assert_eq(dhcp6opt.ia_t1(var m, ia), 3600)
+    test.assert_eq(dhcp6opt.ia_t2(var m, ia), 5400)
+    test.assert_eq(dhcp6msg.find_option(var m, dhcp6opt.ia_options_start(ia), dhcp6msg.opt_end(var m, ia), dhcp6msg.DHCP6_OPT_IAPREFIX, 0), -1)
+    test.assert_eq(dhcp6opt.find_ia(var m, dhcp6msg.DHCP6_OPT_IA_PD, 1), -1)
+
+@test
+fn test_the_captured_advertise_carries_a_prefix_and_two_identifiers() [io]
+    var m = load(advertise_hex())
+    test.assert_eq(m.len(), 85)
+    test.assert_eq(dhcp6msg.validate(var m), dhcp6msg.DHCP6_FAULT_NONE)
+    test.assert_eq(dhcp6msg.msg_type(var m), dhcp6msg.DHCP6_ADVERTISE)
+    test.assert_eq(dhcp6msg.xid(var m), 0x100874)
+
+    let ia = dhcp6opt.find_ia(var m, dhcp6msg.DHCP6_OPT_IA_PD, 0x27fe8f95)
+    test.assert_eq(ia, 4)
+    test.assert_eq(dhcp6opt.ia_is_usable(var m, ia), true)
+    test.assert_eq(dhcp6opt.ia_t1(var m, ia), 0)
+    test.assert_eq(dhcp6opt.ia_t2(var m, ia), 0)
+    let p = dhcp6msg.find_option(var m, dhcp6opt.ia_options_start(ia), dhcp6msg.opt_end(var m, ia), dhcp6msg.DHCP6_OPT_IAPREFIX, 0)
+    test.assert_eq(p, 20)
+    test.assert_eq(dhcp6opt.iaprefix_is_usable(var m, p), true)
+    test.assert_eq(dhcp6opt.iaprefix_preferred(var m, p), 4500)
+    test.assert_eq(dhcp6opt.iaprefix_valid(var m, p), 7200)
+    test.assert_eq(dhcp6opt.iaprefix_length(var m, p), 64)
+    let prefix = dhcp6opt.iaprefix_prefix(var m, p)
+    test.assert_eq(prefix.a, 0x20010000)
+    test.assert_eq(prefix.b, 0x0000fe00)
+    test.assert_eq(prefix.c, 0)
+    test.assert_eq(prefix.d, 0)
+
+    test.case("a T1 and T2 of zero are left to the client: half and 0.8 of the preferred lifetime")
+    test.assert_eq(dhcp6opt.choose_t1(0, 4500), 2250)
+    test.assert_eq(dhcp6opt.choose_t2(0, 4500), 3600)
+
+    test.case("the server's DUID is a DUID-LLT with its own time and address")
+    let sid = dhcp6msg.find(var m, dhcp6msg.DHCP6_OPT_SERVERID)
+    test.assert_eq(sid, 67)
+    test.assert_eq(dhcp6msg.duid_type_at(var m, dhcp6msg.opt_data(sid)), 1)
+    test.assert_eq(dhcp6msg.u32_at(var m, dhcp6msg.opt_data(sid) + 4), 0x1c3825e8)
+    test.assert_eq(dhcp6msg.u8_at(var m, dhcp6msg.opt_data(sid) + 13), 0xbb)
+    test.assert_eq(dhcp6opt.preference(var m), 0)
+    test.assert_eq(dhcp6opt.message_status(var m), 0)
+
+@test
+fn test_the_captured_request_and_reply_agree_on_the_prefix() [io]
+    var req = load(request_hex())
+    var rep = load(reply_hex())
+    test.assert_eq(dhcp6msg.validate(var req), dhcp6msg.DHCP6_FAULT_NONE)
+    test.assert_eq(dhcp6msg.validate(var rep), dhcp6msg.DHCP6_FAULT_NONE)
+    test.assert_eq(dhcp6msg.msg_type(var req), dhcp6msg.DHCP6_REQUEST)
+    test.assert_eq(dhcp6msg.msg_type(var rep), dhcp6msg.DHCP6_REPLY)
+    test.assert_eq(dhcp6msg.xid(var req), 0x49174e)
+    test.assert_eq(dhcp6msg.xid(var rep), 0x49174e)
+
+    test.case("the Request names the server whose DUID the Advertise carried")
+    var adv = load(advertise_hex())
+    let want = dhcp6msg.find(var adv, dhcp6msg.DHCP6_OPT_SERVERID)
+    let have = dhcp6msg.find(var req, dhcp6msg.DHCP6_OPT_SERVERID)
+    test.assert_eq(dhcp6msg.opt_len(var adv, want), dhcp6msg.opt_len(var req, have))
+    var sd: Vec[u8; 130] = Vec.new()
+    test.assert_eq(dhcp6msg.read_duid(var adv, want, var sd), true)
+    test.assert_eq(dhcp6msg.option_equals_duid(var req, have, var sd), true)
+
+    test.case("the Request asks for the prefix with the lifetimes 7200 and 7500 that an earlier lease gave")
+    let ia = dhcp6opt.find_ia(var req, dhcp6msg.DHCP6_OPT_IA_PD, 0x27fe8f95)
+    let p = dhcp6msg.find_option(var req, dhcp6opt.ia_options_start(ia), dhcp6msg.opt_end(var req, ia), dhcp6msg.DHCP6_OPT_IAPREFIX, 0)
+    test.assert_eq(dhcp6opt.iaprefix_preferred(var req, p), 7200)
+    test.assert_eq(dhcp6opt.iaprefix_valid(var req, p), 7500)
+    test.assert_eq(dhcp6opt.iaprefix_length(var req, p), 64)
+
+    test.case("the Reply grants 4500 and 7200 seconds, T1 and T2 zero")
+    let ria = dhcp6opt.find_ia(var rep, dhcp6msg.DHCP6_OPT_IA_PD, 0x27fe8f95)
+    let rp = dhcp6msg.find_option(var rep, dhcp6opt.ia_options_start(ria), dhcp6msg.opt_end(var rep, ria), dhcp6msg.DHCP6_OPT_IAPREFIX, 0)
+    test.assert_eq(dhcp6opt.iaprefix_preferred(var rep, rp), 4500)
+    test.assert_eq(dhcp6opt.iaprefix_valid(var rep, rp), 7200)
+    test.assert_eq(dhcp6opt.ia_t1(var rep, ria), 0)
+
+@test
+fn test_the_captured_release_and_its_reply() [io]
+    var rel = load(release_hex())
+    var rr = load(release_reply_hex())
+    test.assert_eq(dhcp6msg.validate(var rel), dhcp6msg.DHCP6_FAULT_NONE)
+    test.assert_eq(dhcp6msg.msg_type(var rel), dhcp6msg.DHCP6_RELEASE)
+    test.assert_eq(dhcp6msg.xid(var rel), 0xc789b0)
+
+    test.case("the Release carries the prefix with both lifetimes zero")
+    let ia = dhcp6opt.find_ia(var rel, dhcp6msg.DHCP6_OPT_IA_PD, 0x27fe8f95)
+    let p = dhcp6msg.find_option(var rel, dhcp6opt.ia_options_start(ia), dhcp6msg.opt_end(var rel, ia), dhcp6msg.DHCP6_OPT_IAPREFIX, 0)
+    test.assert_eq(dhcp6opt.iaprefix_preferred(var rel, p), 0)
+    test.assert_eq(dhcp6opt.iaprefix_valid(var rel, p), 0)
+    test.assert_eq(dhcp6opt.iaprefix_length(var rel, p), 64)
+
+    test.case("the Reply is Success with a message of words")
+    test.assert_eq(dhcp6msg.validate(var rr), dhcp6msg.DHCP6_FAULT_NONE)
+    test.assert_eq(dhcp6opt.message_status(var rr), 0)
+    let st = dhcp6msg.find(var rr, dhcp6msg.DHCP6_OPT_STATUS_CODE)
+    test.assert_eq(dhcp6opt.status_message_len(var rr, st), 17)
+    test.assert_eq(dhcp6opt.status_message_byte(var rr, st, 0), 0x52)
+    test.assert_eq(dhcp6opt.status_message_byte(var rr, st, 16), 0x2e)
+    test.assert_eq(dhcp6opt.status_message_byte(var rr, st, 17), -1)
+    test.assert_eq(dhcp6opt.status_message_byte(var rr, st, -1), -1)
+
+// The Solicit as the writers build it: the same fields in the same order.
+fn build_solicit(var out: Vec[u8; 1024]) -> Bool
+    var duid = client_duid()
+    var codes: Vec[u16; 16] = Vec.new()
+    let _a = codes.push(23 as u16)
+    let _b = codes.push(24 as u16)
+    var ok = dhcp6msg.begin(var out, dhcp6msg.DHCP6_SOLICIT, 0x100874)
+    ok = ok and dhcp6msg.put_client_id(var out, var duid)
+    ok = ok and dhcp6msg.put_option_request(var out, var codes)
+    ok = ok and dhcp6msg.put_elapsed_time(var out, 0)
+    let ia = dhcp6msg.open_ia_pd(var out, 0x27fe8f95, 3600, 5400)
+    ok = ok and dhcp6msg.close_option(var out, ia)
+    ok
+
+// The Request, rebuilt.
+fn build_request(var out: Vec[u8; 1024]) -> Bool
+    var duid = client_duid()
+    var server = load(advertise_hex())
+    var sd: Vec[u8; 130] = Vec.new()
+    let sid = dhcp6msg.find(var server, dhcp6msg.DHCP6_OPT_SERVERID)
+    let _r = dhcp6msg.read_duid(var server, sid, var sd)
+    var codes: Vec[u16; 16] = Vec.new()
+    let _a = codes.push(23 as u16)
+    let _b = codes.push(24 as u16)
+    var ok = dhcp6msg.begin(var out, dhcp6msg.DHCP6_REQUEST, 0x49174e)
+    ok = ok and dhcp6msg.put_client_id(var out, var duid)
+    ok = ok and dhcp6msg.put_server_id(var out, var sd)
+    ok = ok and dhcp6msg.put_option_request(var out, var codes)
+    ok = ok and dhcp6msg.put_elapsed_time(var out, 0)
+    let ia = dhcp6msg.open_ia_pd(var out, 0x27fe8f95, 3600, 5400)
+    ok = ok and dhcp6msg.put_ia_prefix(var out, 7200, 7500, 64, dhcp6msg.ip6(0x20010000, 0xfe00, 0, 0))
+    ok = ok and dhcp6msg.close_option(var out, ia)
+    ok
+
+// Whether two messages hold the same bytes.
+fn same(var a: Vec[u8; 1024], var b: Vec[u8; 1024]) -> Bool
+    var eq = a.len() == b.len()
+    for i in 0..a.len()
+        if i < b.len() and a[i] != b[i]
+            eq = false
+    eq
+
+@test
+fn test_the_writers_rebuild_the_captured_solicit_and_request_byte_for_byte() [io]
+    var out: Vec[u8; 1024] = Vec.new()
+    test.assert_eq(build_solicit(var out), true)
+    var cap = load(solicit_hex())
+    test.assert_eq(same(var out, var cap), true)
+
+    test.case("the Request, with the server's DUID read from the Advertise")
+    var out2: Vec[u8; 1024] = Vec.new()
+    test.assert_eq(build_request(var out2), true)
+    var cap2 = load(request_hex())
+    test.assert_eq(same(var out2, var cap2), true)

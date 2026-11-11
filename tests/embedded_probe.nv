@@ -70,7 +70,7 @@ fn server_message(kind: Int, txid: Int, var out: Vec[u8; 1024]) -> Bool
     let pd = dhcp6msg.open_ia_pd(var out, 2, 0, 0)
     ok = ok and dhcp6msg.put_ia_prefix(var out, 3600, 7200, 56, dhcp6msg.ip6(0x20010db8, 0x00010000, 0, 0))
     ok = ok and dhcp6msg.close_option(var out, pd)
-    var servers: Vec[dhcp6msg.Ip6; 8] = Vec.new()
+    var servers: Vec[Addr6; 8] = Vec.new()
     let _s1 = servers.push(dhcp6msg.ip6(0x20010db8, 0, 0, 0x53))
     let _s2 = servers.push(dhcp6msg.ip6(0x20010db8, 0, 0, 0x54))
     ok and dhcp6opt.put_dns_servers(var out, var servers)

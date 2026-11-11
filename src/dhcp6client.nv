@@ -190,12 +190,12 @@ struct Dhcp6Client
     adv_unicast: Ip6Slot
     // The address binding.
     has_na: Bool
-    na_addr: dhcp6msg.Ip6
+    na_addr: dhcp6msg.Addr6
     na_pref: Int
     na_valid: Int
     // The prefix binding.
     has_pd: Bool
-    pd_prefix: dhcp6msg.Ip6
+    pd_prefix: dhcp6msg.Addr6
     pd_len: Int
     pd_pref: Int
     pd_valid: Int
@@ -205,11 +205,11 @@ struct Dhcp6Client
     expires: Int
     bound_at: Int
     // The parameters.
-    dns1: dhcp6msg.Ip6
-    dns2: dhcp6msg.Ip6
+    dns1: dhcp6msg.Addr6
+    dns2: dhcp6msg.Addr6
     ndns: Int
     domains: Vec[u8; 128]
-    ntp: dhcp6msg.Ip6
+    ntp: dhcp6msg.Addr6
     has_ntp: Bool
     refresh: Int
 
@@ -217,7 +217,7 @@ struct Dhcp6Client
 // address of a server.
 pub @value
 struct Ip6Slot
-    addr: dhcp6msg.Ip6
+    addr: dhcp6msg.Addr6
     set: Bool
 
 // A client in INIT that identifies itself by `duid`, with the `flags`
@@ -261,7 +261,7 @@ fn client_has_lease(var c: Dhcp6Client) -> Bool
 // The leased address, or ::.
 pub @tier(embedded)
 @no_alloc
-fn client_address(var c: Dhcp6Client) -> dhcp6msg.Ip6
+fn client_address(var c: Dhcp6Client) -> dhcp6msg.Addr6
     c.na_addr
 
 // Whether the client holds an address.
@@ -273,7 +273,7 @@ fn client_has_address(var c: Dhcp6Client) -> Bool
 // The delegated prefix, or ::.
 pub @tier(embedded)
 @no_alloc
-fn client_prefix(var c: Dhcp6Client) -> dhcp6msg.Ip6
+fn client_prefix(var c: Dhcp6Client) -> dhcp6msg.Addr6
     c.pd_prefix
 
 // The length of the delegated prefix in bits.
@@ -291,7 +291,7 @@ fn client_has_prefix(var c: Dhcp6Client) -> Bool
 // The `i`-th DNS server the lease gave, 0 or 1, or ::.
 pub @tier(embedded)
 @no_alloc
-fn client_dns(var c: Dhcp6Client, i: Int) -> dhcp6msg.Ip6
+fn client_dns(var c: Dhcp6Client, i: Int) -> dhcp6msg.Addr6
     if i == 0 and c.ndns > 0
         c.dns1
     elif i == 1 and c.ndns > 1
@@ -392,13 +392,13 @@ fn client_domain_text(var c: Dhcp6Client, n: Int, var out: Vec[u8; 256]) -> Bool
 // The address of the first NTP server the lease gave, or ::.
 pub @tier(embedded)
 @no_alloc
-fn client_ntp(var c: Dhcp6Client) -> dhcp6msg.Ip6
+fn client_ntp(var c: Dhcp6Client) -> dhcp6msg.Addr6
     c.ntp
 
 // The address of the server a unicast message goes to, or ::.
 pub @tier(embedded)
 @no_alloc
-fn client_server_address(var c: Dhcp6Client) -> dhcp6msg.Ip6
+fn client_server_address(var c: Dhcp6Client) -> dhcp6msg.Addr6
     c.unicast.addr
 
 // The identifier of the server the client talks to, replacing what
@@ -636,7 +636,8 @@ fn kind_of_state(state: Int) -> Int
 // message itself.  Answers the action.
 @tier(embedded)
 @no_alloc
-fn begin_exchange(var c: Dhcp6Client, now: Int, random: Int, kind: Int, var out: Vec[u8; 1024]) -> Int
+fn begin_exchange(var c: Dhcp6Client, now: Int, random: Int, kind: Int,
+                  var out: Vec[u8; 1024]) -> Int
     var irt = DHCP6_SOL_TIMEOUT
     c.mrc = 0
     c.deadline = 0
@@ -906,7 +907,11 @@ fn usable_address(var msg: Vec[u8; 1024], ia: Int) -> Int
     var found = -1
     for i in 0..16
         if found < 0
-            let a = dhcp6msg.find_option(var msg, dhcp6opt.ia_options_start(ia), dhcp6msg.opt_end(var msg, ia), dhcp6msg.DHCP6_OPT_IAADDR, i)
+            let a = dhcp6msg.find_option(var msg,
+                dhcp6opt.ia_options_start(ia),
+                dhcp6msg.opt_end(var msg, ia),
+                dhcp6msg.DHCP6_OPT_IAADDR,
+                i)
             if a >= 0 and dhcp6opt.iaaddr_is_usable(var msg, a) and dhcp6opt.iaaddr_valid(var msg, a) > 0
                 found = a
     found
@@ -919,7 +924,11 @@ fn usable_prefix(var msg: Vec[u8; 1024], ia: Int) -> Int
     var found = -1
     for i in 0..16
         if found < 0
-            let a = dhcp6msg.find_option(var msg, dhcp6opt.ia_options_start(ia), dhcp6msg.opt_end(var msg, ia), dhcp6msg.DHCP6_OPT_IAPREFIX, i)
+            let a = dhcp6msg.find_option(var msg,
+                dhcp6opt.ia_options_start(ia),
+                dhcp6msg.opt_end(var msg, ia),
+                dhcp6msg.DHCP6_OPT_IAPREFIX,
+                i)
             if a >= 0 and dhcp6opt.iaprefix_is_usable(var msg, a) and dhcp6opt.iaprefix_valid(var msg, a) > 0
                 found = a
     found
@@ -1007,7 +1016,11 @@ fn take_bindings(var c: Dhcp6Client, now: Int, var msg: Vec[u8; 1024]) -> Int
 fn iaaddr_withdrawn(var msg: Vec[u8; 1024], ia: Int) -> Bool
     var gone = false
     for i in 0..16
-        let a = dhcp6msg.find_option(var msg, dhcp6opt.ia_options_start(ia), dhcp6msg.opt_end(var msg, ia), dhcp6msg.DHCP6_OPT_IAADDR, i)
+        let a = dhcp6msg.find_option(var msg,
+            dhcp6opt.ia_options_start(ia),
+            dhcp6msg.opt_end(var msg, ia),
+            dhcp6msg.DHCP6_OPT_IAADDR,
+            i)
         if a >= 0 and dhcp6opt.iaaddr_is_usable(var msg, a) and dhcp6opt.iaaddr_valid(var msg, a) == 0
             gone = true
     gone
@@ -1062,7 +1075,8 @@ fn become_bound(var c: Dhcp6Client, var msg: Vec[u8; 1024]) -> Int
 // authentication.
 pub @tier(embedded)
 @no_alloc
-fn client_receive(var c: Dhcp6Client, now: Int, random: Int, var msg: Vec[u8; 1024], var out: Vec[u8; 1024]) -> Int
+fn client_receive(var c: Dhcp6Client, now: Int, random: Int, var msg: Vec[u8; 1024],
+                  var out: Vec[u8; 1024]) -> Int
     if not is_for_me(var c, var msg)
         return DHCP6_ACT_NONE
     if c.state == DHCP6_STATE_SOLICIT
@@ -1088,7 +1102,8 @@ fn client_receive(var c: Dhcp6Client, now: Int, random: Int, var msg: Vec[u8; 10
 // A message while a Solicit is out.
 @tier(embedded)
 @no_alloc
-fn receive_solicit(var c: Dhcp6Client, now: Int, random: Int, var msg: Vec[u8; 1024], var out: Vec[u8; 1024]) -> Int
+fn receive_solicit(var c: Dhcp6Client, now: Int, random: Int, var msg: Vec[u8; 1024],
+                   var out: Vec[u8; 1024]) -> Int
     let kind = dhcp6msg.msg_type(var msg)
     take_max_rt(var c, var msg)
     let st = dhcp6opt.message_status(var msg)
@@ -1099,8 +1114,9 @@ fn receive_solicit(var c: Dhcp6Client, now: Int, random: Int, var msg: Vec[u8; 1
                 adopt_server(var c, var msg)
                 return become_bound(var c, var msg)
         return DHCP6_ACT_NONE
-    if st == dhcp6msg.DHCP6_STATUS_NO_ADDRS_AVAIL or st == dhcp6msg.DHCP6_STATUS_NO_PREFIX_AVAIL
-        return DHCP6_ACT_NONE
+    // An Advertise with any status but Success, NoAddrsAvail and
+    // NoPrefixAvail among them, or with nothing the client asked for, is
+    // ignored (section 18.2.9).
     if st != 0 or not advert_is_useful(var c, var msg)
         return DHCP6_ACT_NONE
     let pref = dhcp6opt.preference(var msg)
@@ -1108,7 +1124,8 @@ fn receive_solicit(var c: Dhcp6Client, now: Int, random: Int, var msg: Vec[u8; 1
         let sid = dhcp6msg.find(var msg, dhcp6msg.DHCP6_OPT_SERVERID)
         c.has_adv = dhcp6msg.read_duid(var msg, sid, var c.adv)
         c.adv_pref = pref
-        c.adv_unicast = Ip6Slot { addr: dhcp6opt.server_unicast(var msg), set: dhcp6opt.has_server_unicast(var msg) }
+        c.adv_unicast = Ip6Slot { addr: dhcp6opt.server_unicast(var msg),
+            set: dhcp6opt.has_server_unicast(var msg) }
     if c.has_adv and (pref == 255 or c.count > 1)
         return select_server(var c, now, random, var out)
     DHCP6_ACT_NONE
@@ -1130,7 +1147,8 @@ fn receive_info(var c: Dhcp6Client, now: Int, var msg: Vec[u8; 1024]) -> Int
 // A Reply while a Request, Renew, Rebind or Confirm is out.
 @tier(embedded)
 @no_alloc
-fn receive_reply(var c: Dhcp6Client, now: Int, random: Int, var msg: Vec[u8; 1024], var out: Vec[u8; 1024]) -> Int
+fn receive_reply(var c: Dhcp6Client, now: Int, random: Int, var msg: Vec[u8; 1024],
+                 var out: Vec[u8; 1024]) -> Int
     let st = dhcp6opt.message_status(var msg)
     if st == dhcp6msg.DHCP6_STATUS_USE_MULTICAST
         if c.unicast.set

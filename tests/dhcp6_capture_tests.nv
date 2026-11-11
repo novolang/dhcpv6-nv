@@ -109,7 +109,12 @@ fn test_the_captured_solicit_is_read_field_by_field() [io]
     test.assert_eq(ia, 36)
     test.assert_eq(dhcp6opt.ia_t1(var m, ia), 3600)
     test.assert_eq(dhcp6opt.ia_t2(var m, ia), 5400)
-    test.assert_eq(dhcp6msg.find_option(var m, dhcp6opt.ia_options_start(ia), dhcp6msg.opt_end(var m, ia), dhcp6msg.DHCP6_OPT_IAPREFIX, 0), -1)
+    test.assert_eq(dhcp6msg.find_option(var m,
+        dhcp6opt.ia_options_start(ia),
+        dhcp6msg.opt_end(var m, ia),
+        dhcp6msg.DHCP6_OPT_IAPREFIX,
+        0),
+    -1)
     test.assert_eq(dhcp6opt.find_ia(var m, dhcp6msg.DHCP6_OPT_IA_PD, 1), -1)
 
 @test
@@ -125,7 +130,11 @@ fn test_the_captured_advertise_carries_a_prefix_and_two_identifiers() [io]
     test.assert_eq(dhcp6opt.ia_is_usable(var m, ia), true)
     test.assert_eq(dhcp6opt.ia_t1(var m, ia), 0)
     test.assert_eq(dhcp6opt.ia_t2(var m, ia), 0)
-    let p = dhcp6msg.find_option(var m, dhcp6opt.ia_options_start(ia), dhcp6msg.opt_end(var m, ia), dhcp6msg.DHCP6_OPT_IAPREFIX, 0)
+    let p = dhcp6msg.find_option(var m,
+        dhcp6opt.ia_options_start(ia),
+        dhcp6msg.opt_end(var m, ia),
+        dhcp6msg.DHCP6_OPT_IAPREFIX,
+        0)
     test.assert_eq(p, 20)
     test.assert_eq(dhcp6opt.iaprefix_is_usable(var m, p), true)
     test.assert_eq(dhcp6opt.iaprefix_preferred(var m, p), 4500)
@@ -172,14 +181,22 @@ fn test_the_captured_request_and_reply_agree_on_the_prefix() [io]
 
     test.case("the Request asks for the prefix with the lifetimes 7200 and 7500 that an earlier lease gave")
     let ia = dhcp6opt.find_ia(var req, dhcp6msg.DHCP6_OPT_IA_PD, 0x27fe8f95)
-    let p = dhcp6msg.find_option(var req, dhcp6opt.ia_options_start(ia), dhcp6msg.opt_end(var req, ia), dhcp6msg.DHCP6_OPT_IAPREFIX, 0)
+    let p = dhcp6msg.find_option(var req,
+        dhcp6opt.ia_options_start(ia),
+        dhcp6msg.opt_end(var req, ia),
+        dhcp6msg.DHCP6_OPT_IAPREFIX,
+        0)
     test.assert_eq(dhcp6opt.iaprefix_preferred(var req, p), 7200)
     test.assert_eq(dhcp6opt.iaprefix_valid(var req, p), 7500)
     test.assert_eq(dhcp6opt.iaprefix_length(var req, p), 64)
 
     test.case("the Reply grants 4500 and 7200 seconds, T1 and T2 zero")
     let ria = dhcp6opt.find_ia(var rep, dhcp6msg.DHCP6_OPT_IA_PD, 0x27fe8f95)
-    let rp = dhcp6msg.find_option(var rep, dhcp6opt.ia_options_start(ria), dhcp6msg.opt_end(var rep, ria), dhcp6msg.DHCP6_OPT_IAPREFIX, 0)
+    let rp = dhcp6msg.find_option(var rep,
+        dhcp6opt.ia_options_start(ria),
+        dhcp6msg.opt_end(var rep, ria),
+        dhcp6msg.DHCP6_OPT_IAPREFIX,
+        0)
     test.assert_eq(dhcp6opt.iaprefix_preferred(var rep, rp), 4500)
     test.assert_eq(dhcp6opt.iaprefix_valid(var rep, rp), 7200)
     test.assert_eq(dhcp6opt.ia_t1(var rep, ria), 0)
@@ -194,7 +211,11 @@ fn test_the_captured_release_and_its_reply() [io]
 
     test.case("the Release carries the prefix with both lifetimes zero")
     let ia = dhcp6opt.find_ia(var rel, dhcp6msg.DHCP6_OPT_IA_PD, 0x27fe8f95)
-    let p = dhcp6msg.find_option(var rel, dhcp6opt.ia_options_start(ia), dhcp6msg.opt_end(var rel, ia), dhcp6msg.DHCP6_OPT_IAPREFIX, 0)
+    let p = dhcp6msg.find_option(var rel,
+        dhcp6opt.ia_options_start(ia),
+        dhcp6msg.opt_end(var rel, ia),
+        dhcp6msg.DHCP6_OPT_IAPREFIX,
+        0)
     test.assert_eq(dhcp6opt.iaprefix_preferred(var rel, p), 0)
     test.assert_eq(dhcp6opt.iaprefix_valid(var rel, p), 0)
     test.assert_eq(dhcp6opt.iaprefix_length(var rel, p), 64)
@@ -293,7 +314,8 @@ fn test_the_client_runs_the_captured_exchange_from_solicit_to_release() [io]
     var sd: Vec[u8; 130] = Vec.new()
     let want = dhcp6msg.find(var cap_request, dhcp6msg.DHCP6_OPT_SERVERID)
     test.assert_eq(dhcp6msg.read_duid(var cap_request, want, var sd), true)
-    test.assert_eq(dhcp6msg.option_equals_duid(var out, dhcp6msg.find(var out, dhcp6msg.DHCP6_OPT_SERVERID), var sd), true)
+    test.assert_eq(dhcp6msg.option_equals_duid(var out, dhcp6msg.find(var out, dhcp6msg.DHCP6_OPT_SERVERID), var sd),
+        true)
 
     test.case("the captured Reply binds the prefix 2001:0:0:fe00::/64 for 7200 seconds")
     var rep = load(reply_hex())
@@ -314,16 +336,27 @@ fn test_the_client_runs_the_captured_exchange_from_solicit_to_release() [io]
     test.assert_eq(dhcp6msg.xid(var out), dhcp6msg.xid(var cap_release))
     test.assert_eq(dhcp6msg.msg_type(var out), dhcp6msg.DHCP6_RELEASE)
     var mine = client_duid()
-    test.assert_eq(dhcp6msg.option_equals_duid(var out, dhcp6msg.find(var out, dhcp6msg.DHCP6_OPT_CLIENTID), var mine), true)
-    test.assert_eq(dhcp6msg.option_equals_duid(var out, dhcp6msg.find(var out, dhcp6msg.DHCP6_OPT_SERVERID), var sd), true)
+    test.assert_eq(dhcp6msg.option_equals_duid(var out, dhcp6msg.find(var out, dhcp6msg.DHCP6_OPT_CLIENTID), var mine),
+        true)
+    test.assert_eq(dhcp6msg.option_equals_duid(var out, dhcp6msg.find(var out, dhcp6msg.DHCP6_OPT_SERVERID), var sd),
+        true)
     let ia = dhcp6opt.find_ia(var out, dhcp6msg.DHCP6_OPT_IA_PD, 0x27fe8f95)
-    let rp = dhcp6msg.find_option(var out, dhcp6opt.ia_options_start(ia), dhcp6msg.opt_end(var out, ia), dhcp6msg.DHCP6_OPT_IAPREFIX, 0)
+    let rp = dhcp6msg.find_option(var out,
+        dhcp6opt.ia_options_start(ia),
+        dhcp6msg.opt_end(var out, ia),
+        dhcp6msg.DHCP6_OPT_IAPREFIX,
+        0)
     let cia = dhcp6opt.find_ia(var cap_release, dhcp6msg.DHCP6_OPT_IA_PD, 0x27fe8f95)
-    let cp = dhcp6msg.find_option(var cap_release, dhcp6opt.ia_options_start(cia), dhcp6msg.opt_end(var cap_release, cia), dhcp6msg.DHCP6_OPT_IAPREFIX, 0)
+    let cp = dhcp6msg.find_option(var cap_release,
+        dhcp6opt.ia_options_start(cia),
+        dhcp6msg.opt_end(var cap_release, cia),
+        dhcp6msg.DHCP6_OPT_IAPREFIX,
+        0)
     test.assert_eq(dhcp6opt.iaprefix_length(var out, rp), dhcp6opt.iaprefix_length(var cap_release, cp))
     test.assert_eq(dhcp6opt.iaprefix_valid(var out, rp), dhcp6opt.iaprefix_valid(var cap_release, cp))
     test.assert_eq(dhcp6opt.iaprefix_preferred(var out, rp), dhcp6opt.iaprefix_preferred(var cap_release, cp))
-    test.assert_eq(dhcp6msg.ip6_eq(dhcp6opt.iaprefix_prefix(var out, rp), dhcp6opt.iaprefix_prefix(var cap_release, cp)), true)
+    test.assert_eq(dhcp6msg.ip6_eq(dhcp6opt.iaprefix_prefix(var out, rp), dhcp6opt.iaprefix_prefix(var cap_release, cp)),
+        true)
 
     test.case("the captured Reply to the Release ends the exchange")
     var done = load(release_reply_hex())

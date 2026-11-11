@@ -100,7 +100,7 @@ fn ia_is_usable(var m: Vec[u8; 1024], o: Int) -> Bool
 // The address of an IA Address option at `o`.
 pub @tier(embedded)
 @no_alloc
-fn iaaddr_address(var m: Vec[u8; 1024], o: Int) -> dhcp6msg.Ip6
+fn iaaddr_address(var m: Vec[u8; 1024], o: Int) -> dhcp6msg.Addr6
     dhcp6msg.ip6_at(var m, o + 4)
 
 // The preferred lifetime of an IA Address option, in seconds.
@@ -151,7 +151,7 @@ fn iaprefix_length(var m: Vec[u8; 1024], o: Int) -> Int
 // them.
 pub @tier(embedded)
 @no_alloc
-fn iaprefix_prefix(var m: Vec[u8; 1024], o: Int) -> dhcp6msg.Ip6
+fn iaprefix_prefix(var m: Vec[u8; 1024], o: Int) -> dhcp6msg.Addr6
     dhcp6msg.ip6_at(var m, o + 13)
 
 // Where the options inside an IA Prefix option start.
@@ -289,7 +289,7 @@ fn reconfigure_kind(var m: Vec[u8; 1024]) -> Int
 // The address in the Server Unicast option, or :: when there is none.
 pub @tier(embedded)
 @no_alloc
-fn server_unicast(var m: Vec[u8; 1024]) -> dhcp6msg.Ip6
+fn server_unicast(var m: Vec[u8; 1024]) -> dhcp6msg.Addr6
     let o = dhcp6msg.find(var m, dhcp6msg.DHCP6_OPT_UNICAST)
     if o >= 0 and dhcp6msg.opt_len(var m, o) == 16
         dhcp6msg.ip6_at(var m, o + 4)
@@ -396,7 +396,7 @@ fn dns_server_count(var m: Vec[u8; 1024]) -> Int
 // The `i`-th DNS server address, or ::.
 pub @tier(embedded)
 @no_alloc
-fn dns_server(var m: Vec[u8; 1024], i: Int) -> dhcp6msg.Ip6
+fn dns_server(var m: Vec[u8; 1024], i: Int) -> dhcp6msg.Addr6
     let o = dhcp6msg.find(var m, dhcp6msg.DHCP6_OPT_DNS_SERVERS)
     if i < 0 or i >= dns_server_count(var m)
         dhcp6msg.ip6_zero()
@@ -407,7 +407,7 @@ fn dns_server(var m: Vec[u8; 1024], i: Int) -> dhcp6msg.Ip6
 // held in `servers`.
 pub @tier(embedded)
 @no_alloc
-fn put_dns_servers(var m: Vec[u8; 1024], var servers: Vec[dhcp6msg.Ip6; 8]) -> Bool
+fn put_dns_servers(var m: Vec[u8; 1024], var servers: Vec[Addr6; 8]) -> Bool
     var ok = dhcp6msg.put_u16(var m, dhcp6msg.DHCP6_OPT_DNS_SERVERS) and dhcp6msg.put_u16(var m, servers.len() * 16)
     for i in 0..servers.len()
         ok = ok and dhcp6msg.put_ip6(var m, servers[i])
@@ -557,7 +557,7 @@ fn ntp_suboption(var m: Vec[u8; 1024], o: Int, code: Int, nth: Int) -> Int
 // when the sub-option is not sixteen bytes.
 pub @tier(embedded)
 @no_alloc
-fn ntp_address(var m: Vec[u8; 1024], sub: Int) -> dhcp6msg.Ip6
+fn ntp_address(var m: Vec[u8; 1024], sub: Int) -> dhcp6msg.Addr6
     if sub >= 0 and dhcp6msg.opt_len(var m, sub) == 16
         dhcp6msg.ip6_at(var m, sub + 4)
     else
@@ -572,13 +572,13 @@ fn open_ntp_server(var m: Vec[u8; 1024]) -> Int
 // A sub-option holding a server address, inside an NTP Server option.
 pub @tier(embedded)
 @no_alloc
-fn put_ntp_server_address(var m: Vec[u8; 1024], x: dhcp6msg.Ip6) -> Bool
+fn put_ntp_server_address(var m: Vec[u8; 1024], x: dhcp6msg.Addr6) -> Bool
     dhcp6msg.put_option_ip6(var m, DHCP6_NTP_SRV_ADDR, x)
 
 // A sub-option holding a multicast address, inside an NTP Server option.
 pub @tier(embedded)
 @no_alloc
-fn put_ntp_multicast_address(var m: Vec[u8; 1024], x: dhcp6msg.Ip6) -> Bool
+fn put_ntp_multicast_address(var m: Vec[u8; 1024], x: dhcp6msg.Addr6) -> Bool
     dhcp6msg.put_option_ip6(var m, DHCP6_NTP_MC_ADDR, x)
 
 // ── Classes and vendor options ──────────────────────────────────────

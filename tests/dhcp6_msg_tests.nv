@@ -584,3 +584,48 @@ fn test_numbers_the_format_fixes() [io]
     test.assert_eq(dhcp6msg.DHCP6_OPT_NTP_SERVER, 56)
     test.assert_eq(dhcp6msg.DHCP6_OPT_SOL_MAX_RT, 82)
     test.assert_eq(dhcp6msg.DHCP6_OPT_INF_MAX_RT, 83)
+
+@test
+fn test_the_generic_option_writers() [io]
+    var m: Vec[u8; 1024] = Vec.new()
+    let _b = dhcp6msg.begin(var m, dhcp6msg.DHCP6_ADVERTISE, 1)
+
+    test.case("an option of one address")
+    test.assert_eq(dhcp6msg.put_option_ip6(var m, 300, dhcp6msg.ip6(1, 2, 3, 4)), true)
+    test.assert_eq(dhcp6msg.opt_len(var m, 4), 16)
+    test.assert_eq(dhcp6msg.ip6_at(var m, 8).d, 4)
+
+    test.case("an option of a DUID's bytes")
+    var duid: Vec[u8; 130] = Vec.new()
+    for b in [0, 4, 9, 8, 7]
+        let _p = duid.push(b as u8)
+    test.assert_eq(dhcp6msg.put_option_duid(var m, 301, var duid), true)
+    test.assert_eq(dhcp6msg.opt_len(var m, 24), 5)
+    test.assert_eq(dhcp6msg.u8_at(var m, 28 + 2), 9)
+
+    test.case("an option of up to 128 bytes, which may be none")
+    var data: Vec[u8; 128] = Vec.new()
+    for i in 0..128
+        let _p = data.push(i as u8)
+    test.assert_eq(dhcp6msg.put_option_bytes(var m, 302, var data), true)
+    test.assert_eq(dhcp6msg.opt_len(var m, 33), 128)
+    test.assert_eq(dhcp6msg.u8_at(var m, 37 + 127), 127)
+    var none: Vec[u8; 128] = Vec.new()
+    test.assert_eq(dhcp6msg.put_option_bytes(var m, 303, var none), true)
+    test.assert_eq(dhcp6msg.opt_len(var m, 33 + 4 + 128), 0)
+    test.assert_eq(dhcp6msg.validate(var m), dhcp6msg.DHCP6_FAULT_NONE)
+
+    test.case("a 24-bit number")
+    var t: Vec[u8; 1024] = Vec.new()
+    test.assert_eq(dhcp6msg.put_u24(var t, 0xA1B2C3), true)
+    test.assert_eq(dhcp6msg.u24_at(var t, 0), 0xA1B2C3)
+    test.assert_eq(t.len(), 3)
+
+@test
+fn test_the_option_area_is_checked_end_to_end() [io]
+    var m = load(solicit_hex())
+    test.assert_eq(dhcp6msg.options_well_formed(var m, 4, m.len()), true)
+    test.assert_eq(dhcp6msg.options_well_formed(var m, 4, m.len() - 1), false)
+    test.assert_eq(dhcp6msg.options_well_formed(var m, 4, 4), true)
+    test.assert_eq(dhcp6msg.options_well_formed(var m, 4, 6), false)
+    test.assert_eq(dhcp6msg.options_well_formed(var m, 18, 34), true)
